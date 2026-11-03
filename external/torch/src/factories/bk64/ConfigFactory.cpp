@@ -1,0 +1,2276 @@
+#include "ConfigFactory.h"
+#include "BKByteUtils.h"
+#include "BKEmitText.h"
+#include "BKMapNames.h"
+#include "BKAssetTable.h"
+#include "Companion.h"
+#include "TinySHA1.hpp"
+#include "binarytools/BinaryReader.h"
+#include "spdlog/spdlog.h"
+#include "utils/TorchUtils.h"
+#include <algorithm>
+#include <bk_zip/bk_unzip.h>
+#include <cstring>
+#include <fstream>
+#include <functional>
+#include <unordered_map>
+#include <yaml-cpp/yaml.h>
+
+namespace BK64 {
+
+namespace fs = std::filesystem;
+
+// Helpers
+
+// Simple LE binary writer
+struct BlobWriter {
+    std::vector<char> data;
+
+    void writeU8(uint8_t v) {
+        data.push_back(static_cast<char>(v));
+    }
+    void writeU16(uint16_t v) {
+        writeU8(v & 0xFF);
+        writeU8((v >> 8) & 0xFF);
+    }
+    void writeU32(uint32_t v) {
+        writeU16(v & 0xFFFF);
+        writeU16((v >> 16) & 0xFFFF);
+    }
+    void writeS16(int16_t v) {
+        writeU16(static_cast<uint16_t>(v));
+    }
+
+    // Write section header, return index to patch entry_count later
+    size_t beginSection(ConfigSectionType type) {
+        writeU16(static_cast<uint16_t>(type));
+        size_t countPos = data.size();
+        writeU16(0); // placeholder
+        return countPos;
+    }
+
+    void patchU16(size_t pos, uint16_t val) {
+        data[pos] = static_cast<char>(val & 0xFF);
+        data[pos + 1] = static_cast<char>((val >> 8) & 0xFF);
+    }
+};
+
+// BB overlay constant definitions
+
+struct BBConfig {
+    uint32_t offset;
+    uint16_t vanilla;
+    bool isByte;
+};
+
+static const BBConfig sBBConfigs[] = {
+    { 254331, 0x85, true },     // NEW_GAME_MAP
+    { 624378, 0x01, true },     // START_LEVEL_1
+    { 625582, 0x69, true },     // START_LEVEL_2
+    { 59470, 0xC3A0, false },   // KNOW_ALL_MOVES
+    { 305126, 5, false },       // MUMBO_COST_TERMITE
+    { 305134, 10, false },      // MUMBO_COST_CROC
+    { 305142, 15, false },      // MUMBO_COST_WALRUS
+    { 305150, 20, false },      // MUMBO_COST_PUMPKIN
+    { 305158, 25, false },      // MUMBO_COST_BEE
+    { 782878, 100, false },     // EGGS_NORMAL_MAX
+    { 782910, 50, false },      // RED_FEATHERS_NORMAL_MAX
+    { 782938, 10, false },      // GOLD_FEATHERS_NORMAL_MAX
+    { 782870, 200, false },     // EGGS_CHEATO_MAX
+    { 782902, 100, false },     // RED_FEATHERS_CHEATO_MAX
+    { 782934, 20, false },      // GOLD_FEATHERS_CHEATO_MAX
+    { 19162, 100, false },      // NOTES_MAX
+    { 568414, 10, false },      // JIGGIES_PER_WORLD
+    { 568490, 2, false },       // HONEYCOMBS_PER_WORLD
+    { 568494, 6, false },       // EXTRA_HC_START
+    { 0x986FA, 0x0112, false }, // WARP_EXIT_BANJOS_HOUSE
+    { 0x98BAE, 0x6912, false }, // WARP_ENTER_LAIR
+    { 568479, 0x0B, true },     // SPECIAL_LEVEL (vanilla: Spiral Mountain = 0x0B)
+    { 570539, 0x0B, true },     // HIDE_JIGGIES_LEVEL (vanilla: Spiral Mountain = 0x0B)
+    { 571219, 0x06, true },     // HIDE_COLLECTIBLES_LEVEL (vanilla: Grunty's Lair = 0x06)
+};
+static_assert(sizeof(sBBConfigs) / sizeof(sBBConfigs[0]) == static_cast<int>(CodeConstantKey::COUNT));
+
+// Vanilla defaults for FCF698 data (lair overlay objects)
+
+// Note door thresholds (12 doors)
+static const uint16_t sVanillaNoteDoors[12] = { 50, 180, 260, 350, 450, 640, 765, 810, 828, 846, 864, 882 };
+
+// Jiggy puzzles (11 entries, 4 bytes each): { u8 cost; u8 size_bits; u16 progress_flag }.
+static const uint8_t sVanillaJiggyCosts[11] = { 1, 2, 5, 7, 8, 9, 10, 12, 15, 25, 4 };
+static const uint8_t sVanillaJiggySizes[11] = { 1, 2, 3, 3, 4, 4, 4, 4, 4, 5, 3 };
+static const uint16_t sVanillaJiggyFlags[11] = { 0x5D, 0x5E, 0x60, 0x63, 0x66, 0x6A, 0x6E, 0x72, 0x76, 0x7A, 0x7F };
+
+// Vanilla level names (pause menu display)
+static const char* sVanillaLevelNames[13] = { "GAME TOTAL",          "SPIRAL MOUNTAIN",     "GRUNTILDA'S LAIR",
+                                              "MUMBO'S MOUNTAIN",    "TREASURE TROVE COVE", "CLANKER'S CAVERN",
+                                              "BUBBLEGLOOP SWAMP",   "FREEZEEZY PEAK",      "GOBI'S VALLEY",
+                                              "MAD MONSTER MANSION", "RUSTY BUCKET BAY",    "CLICK CLOCK WOOD",
+                                              "STOP 'N' SWOP" };
+
+// ROM layout constants (US rev0)
+
+// FCF698 lair-overlay data block (note doors, jiggy puzzles)
+static constexpr uint32_t FCF698_ROM_OFFSET = 0x3F5CDB0;
+static constexpr uint32_t FCF698_SIZE = 9888;
+static constexpr uint32_t FCF698_NOTE_DOORS_OFF = 1996;
+static constexpr uint32_t FCF698_JIGGY_PUZZLES_OFF = 6984;
+
+// Custom-code blob detection window
+static constexpr uint32_t CUSTOM_CODE_ROM_OFFSET = 0x3F00000;
+static constexpr uint32_t CUSTOM_CODE_RAM_BASE = 0x80400000;
+static constexpr uint32_t CUSTOM_CODE_RAM_END = 0x80800000;
+static constexpr uint32_t CUSTOM_CODE_RAW_MAX_SIZE = 0x100000; // raw-blob window before 0xFF trim
+static constexpr int CUSTOM_CODE_MIN_INTERNAL_JALS = 4;        // self-call threshold
+
+// Vanilla overlay locations and sizes
+static constexpr uint32_t VANILLA_OVERLAY_SIZE = 902656;
+static constexpr uint32_t VANILLA_F37F90_OFFSET = 0xF37F90;
+static constexpr uint32_t VANILLA_CORE1_SIZE = 228336;
+static constexpr uint32_t VANILLA_CORE1_ROM_OFFSET = 0xF19250;
+static constexpr uint32_t VANILLA_F9CAE0 = 0xF9CAE0;
+
+// F9CAE0 warp-function pointer table (558 entries at 0xC3F0), and the RAM base the
+// pointers are relative to. BB base: 0x80000000 + 2650000 (Form1.cs line 2538).
+static constexpr uint32_t WARP_TABLE_OFF = 0xC3F0;
+static constexpr int WARP_ENTRY_COUNT = 558;
+static constexpr uint32_t N64_OVL_BASE = 0x80000000U + 2650000U;
+
+// Epilogue signature that closes a simple warp stub.
+static const uint8_t kWarpEpilogue[16] = {
+    0x8F, 0xBF, 0x00, 0x14, // LW $ra, 0x14($sp)
+    0x27, 0xBD, 0x00, 0x18, // ADDIU $sp, $sp, 0x18
+    0x03, 0xE0, 0x00, 0x08, // JR $ra
+    0x00, 0x00, 0x00, 0x00  // NOP
+};
+
+// Callees a warp stub can tail-call, and what each adds to the $a1 immediate before it
+// is a MAP<<8|ENTRY destination. Three slots go through a transformation-gated wrapper
+// that biases the argument, so their immediates are only part of the address.
+struct WarpTailCall {
+    uint32_t addr; // RAM, not an overlay offset
+    int destBias;
+};
+static const WarpTailCall kWarpTailCalls[] = {
+    { 0x8031CC8C, 0x0000 }, // the plain warp
+    { 0x8031DC8C, 0x1000 }, // Big Croc's nostrils, croc only
+    { 0x8031DBAC, 0x2F00 }, // MMM drainpipe, pumpkin only
+};
+
+static int ResolveWarpDest(const uint8_t* f, uint32_t i, int rawImm) {
+    if (i < 4) {
+        return -1;
+    }
+    uint32_t jal = ReadU32BE(f + i - 4);
+    if ((jal >> 26) != 3) {
+        return -1;
+    }
+    uint32_t target = 0x80000000u | ((jal & 0x03FFFFFFu) << 2);
+    for (const auto& call : kWarpTailCalls) {
+        if (call.addr == target) {
+            return rawImm + call.destBias;
+        }
+    }
+    return -1;
+}
+
+// Decompress an rzip blob (magic 0x11 0x72) at `off`, or nullptr. Caller frees.
+static uint8_t* TryUnzipAt(const std::vector<uint8_t>& rom, uint32_t off, uint32_t* outSize) {
+    *outSize = 0x100000;
+    if (off + 6 >= rom.size() || rom[off] != 0x11 || rom[off + 1] != 0x72) {
+        return nullptr;
+    }
+    try {
+        return bk_unzip(rom.data() + off, outSize);
+    } catch (...) { return nullptr; }
+}
+
+static void Sha1Into(const uint8_t* data, size_t len, uint8_t out[20]) {
+    sha1::SHA1 s;
+    s.processBytes(data, len);
+    uint32_t digest[5];
+    s.getDigest(digest);
+    for (int i = 0; i < 5; i++) {
+        WriteU32BE(out + i * 4, digest[i]);
+    }
+}
+
+// 20 raw digest bytes -> 40-char lowercase hex + NUL.
+static void Sha1HexString(const uint8_t sha1[20], char out[41]) {
+    for (int i = 0; i < 20; i++) {
+        std::snprintf(out + i * 2, 3, "%02x", sha1[i]);
+    }
+}
+
+// Sorted unique warp-function start offsets referenced by an F9CAE0 table, so each
+// scan can be bounded by the next function instead of a blind 200-byte window.
+static std::vector<uint32_t> CollectWarpFuncOffsets(const uint8_t* f9) {
+    std::vector<uint32_t> funcOffs;
+    funcOffs.reserve(WARP_ENTRY_COUNT);
+    for (int w = 0; w < WARP_ENTRY_COUNT; w++) {
+        uint32_t addr = ReadU32BE(f9 + WARP_TABLE_OFF + w * 4);
+        if (addr >= N64_OVL_BASE) {
+            funcOffs.push_back(addr - N64_OVL_BASE);
+        }
+    }
+    std::sort(funcOffs.begin(), funcOffs.end());
+    funcOffs.erase(std::unique(funcOffs.begin(), funcOffs.end()), funcOffs.end());
+    return funcOffs;
+}
+
+// Asset-table hashing
+//
+// Lighthouse ships a per-slot SHA-1 of the v1.0 baseline at assets/yaml/<region>/<rev>/hashes.yaml.
+// When extracting a BB romhack, we hash each slot's compressed bytes: a match means the slot is bit-for-bit
+// vanilla, so skip the factory entirely.
+
+// Walk the BK64 asset table at ROM 0x5E90 and invoke `onSlot(index, sha1Hex)` for every non-empty,
+// non-zero-sized slot. Returns the total slot count (including empty slots), or 0 on parse failure.
+static size_t WalkAssetTable(const std::vector<uint8_t>& rom,
+                             const std::function<void(uint32_t, const std::string&)>& onSlot) {
+    if (rom.size() < 0x6000) {
+        SPDLOG_ERROR("ROM too small to contain BK64 asset table");
+        return 0;
+    }
+
+    constexpr uint32_t kAssetTableOffset = 0x5E90;
+
+    LUS::BinaryReader reader(reinterpret_cast<char*>(const_cast<uint8_t*>(rom.data() + kAssetTableOffset)),
+                             rom.size() - kAssetTableOffset);
+    reader.SetEndianness(Torch::Endianness::Big);
+    const uint32_t assetCount = reader.ReadUInt32();
+    reader.ReadUInt32();
+
+    if (assetCount == 0 || assetCount > 0x10000) {
+        SPDLOG_ERROR("Implausible asset count {} at 0x{:X}", assetCount, kAssetTableOffset);
+        return 0;
+    }
+
+    const uint32_t dataStart = kAssetTableOffset + 8 + assetCount * 8;
+    if (dataStart >= rom.size()) {
+        SPDLOG_ERROR("Asset table extends past ROM end");
+        return 0;
+    }
+
+    struct Entry {
+        uint32_t blobOffset;
+        int16_t compressionFlag;
+        int16_t tFlag;
+    };
+    std::vector<Entry> entries(assetCount);
+    for (uint32_t i = 0; i < assetCount; i++) {
+        entries[i].blobOffset = reader.ReadUInt32();
+        entries[i].compressionFlag = reader.ReadInt16();
+        entries[i].tFlag = reader.ReadInt16();
+    }
+
+    std::vector<uint32_t> offsets;
+    offsets.reserve(assetCount);
+    for (const auto& e : entries) {
+        offsets.push_back(e.blobOffset);
+    }
+    const SlotSizer slotSize(offsets, dataStart, rom.size());
+
+    for (uint32_t i = 0; i < assetCount; i++) {
+        const auto& e = entries[i];
+        if (e.tFlag == 4 || slotSize.IsStray(i)) {
+            continue;
+        }
+
+        const uint32_t absOff = dataStart + e.blobOffset;
+        const uint32_t size = slotSize(e.blobOffset);
+        if (size == 0 || absOff + size > rom.size()) {
+            continue;
+        }
+
+        sha1::SHA1 s;
+        s.processBytes(rom.data() + absOff, size);
+        uint32_t digest[5];
+        s.getDigest(digest);
+        char buf[41];
+        std::snprintf(buf, sizeof(buf), "%08x%08x%08x%08x%08x", digest[0], digest[1], digest[2], digest[3], digest[4]);
+
+        onSlot(i, std::string(buf));
+    }
+
+    return assetCount;
+}
+
+// Find patched overlay via EOR boot code pointers
+
+static uint8_t* FindPatchedOverlay(const std::vector<uint8_t>& rom, uint32_t& outSize, uint32_t& outRomAddr) {
+    struct EORPair {
+        uint32_t u;
+        uint32_t l;
+    };
+    static const EORPair eorPairs[] = {
+        { 0x107E, 0x1086 }, { 0x2872, 0x287A }, { 0x287E, 0x2886 }, { 0x288A, 0x2892 }, { 0x2896, 0x289A },
+        { 0x28EA, 0x28F2 }, { 0x28F6, 0x28FE }, { 0x2902, 0x290A }, { 0x290E, 0x2912 },
+    };
+
+    for (const auto& pair : eorPairs) {
+        uint16_t pLui = ReadU16BE(rom.data() + pair.u);
+        uint16_t pAddiu = ReadU16BE(rom.data() + pair.l);
+        uint32_t addr = (pLui << 16) + static_cast<int16_t>(pAddiu);
+
+        if (addr == 0 || addr >= rom.size() - 6)
+            continue;
+        if (rom[addr] != 0x11 || rom[addr + 1] != 0x72)
+            continue;
+
+        uint32_t expectedLen = ReadU32BE(rom.data() + addr + 2);
+        if (expectedLen < 800000 || expectedLen > 1000000)
+            continue;
+
+        try {
+            uint32_t sz = 0x100000;
+            uint8_t* result = bk_unzip(rom.data() + addr, &sz);
+            if (result && sz == expectedLen) {
+                outSize = sz;
+                outRomAddr = addr;
+                return result;
+            }
+            if (result)
+                free(result);
+        } catch (...) {}
+    }
+
+    outSize = 0;
+    outRomAddr = 0;
+    return nullptr;
+}
+
+// Find relocated F9CAE0
+
+static uint8_t* FindRelocatedF9CAE0(const std::vector<uint8_t>& rom, uint32_t f37RomAddr, uint32_t& outSize) {
+    for (uint32_t scan = f37RomAddr + 6; scan < f37RomAddr + 0x80000 && scan + 6 < rom.size(); scan++) {
+        if (rom[scan] != 0x11)
+            continue;
+        if (rom[scan + 1] != 0x72)
+            continue;
+
+        uint32_t expected = ReadU32BE(rom.data() + scan + 2);
+        if (expected < 80000 || expected > 100000)
+            continue;
+
+        try {
+            uint32_t sz = 0x100000;
+            uint8_t* result = bk_unzip(rom.data() + scan, &sz);
+            if (result && sz == expected) {
+                SPDLOG_INFO("[ConfigFactory] Found relocated F9CAE0 at ROM 0x{:X} ({} bytes)", scan, sz);
+                outSize = sz;
+                return result;
+            }
+            if (result)
+                free(result);
+        } catch (...) {}
+
+        break;
+    }
+
+    outSize = 0;
+    return nullptr;
+}
+
+// No-vanilla variant: find the warp stub's destination immediate in a single
+// overlay. Used when the hack overwrote its stock F9CAE0/F37F90 copies, so there
+// is nothing to diff against and every resolvable destination is emitted.
+static bool ScanWarpDestOnly(const uint8_t* ovl, uint32_t funcOff, uint32_t funcLen, uint32_t ovlSize, int& outDest) {
+    outDest = -1;
+    uint32_t limit = std::min<uint32_t>(funcLen, 200);
+    if (funcOff + limit > ovlSize || limit < 20) {
+        return false;
+    }
+    const uint8_t* f = ovl + funcOff;
+    for (uint32_t i = 0; i + 20 <= limit; i += 4) {
+        if ((f[i] == 0x24 || f[i] == 0x34) && f[i + 1] == 0x05 && memcmp(f + i + 4, kWarpEpilogue, 16) == 0) {
+            outDest = ResolveWarpDest(f, i, ReadU16BE(f + i + 2));
+            if (outDest >= 0) {
+                return true;
+            }
+            i += 16; // not a warp callee, step over the epilogue and keep looking
+            continue;
+        }
+        if (f[i] == 0x03 && f[i + 1] == 0xE0 && f[i + 2] == 0x00 && f[i + 3] == 0x08) {
+            return false;
+        }
+    }
+    return false;
+}
+
+static bool ScanWarpDestDiff(const uint8_t* vanOvl, const uint8_t* modOvl, uint32_t funcOff, uint32_t funcLen,
+                             uint32_t ovlSize, int& outVanDest, int& outModDest) {
+    outVanDest = -1;
+    outModDest = -1;
+    uint32_t limit = std::min<uint32_t>(funcLen, 200);
+    if (funcOff + limit > ovlSize || limit < 20) {
+        return false;
+    }
+
+    const uint8_t* van = vanOvl + funcOff;
+    const uint8_t* mod = modOvl + funcOff;
+    for (uint32_t i = 0; i + 20 <= limit; i += 4) {
+        if ((van[i] == 0x24 || van[i] == 0x34) && van[i + 1] == 0x05 && memcmp(van + i + 4, kWarpEpilogue, 16) == 0) {
+            // Same load must still be present in the modified overlay.
+            if ((mod[i] == 0x24 || mod[i] == 0x34) && mod[i + 1] == 0x05) {
+                // Resolve against the vanilla jal
+                int vanDest = ResolveWarpDest(van, i, ReadU16BE(van + i + 2));
+                int modDest = ResolveWarpDest(van, i, ReadU16BE(mod + i + 2));
+                if (vanDest >= 0 && vanDest != modDest) {
+                    outVanDest = vanDest;
+                    outModDest = modDest;
+                    return true;
+                }
+            }
+            i += 16; // skip the epilogue; a conditional warp may have another site after it
+            continue;
+        }
+        // Bare JR $ra outside a matched site: end of this warp stub.
+        if (van[i] == 0x03 && van[i + 1] == 0xE0 && van[i + 2] == 0x00 && van[i + 3] == 0x08) {
+            return false;
+        }
+    }
+    return false;
+}
+
+// Custom-code blob detection
+//
+// Some hacks inject their own MIPS code at ROM 0x3F00000; the boot loader copies it up to
+// high RAM (0x80780000 for some hacks, 0x80400000 for others, e.g. The Jiggies of Time)
+// and the hack rewrites a few vanilla `jal`s to jump into it. Lighthouse runs the
+// decompiled C, not the original MIPS, so none of that survives at runtime. The hack's
+// scripted behavior just quietly never happens.
+//
+// We can at least spot it and warn, so users aren't left wondering why a hack feels
+// half-broken on the port. Both signals have to fire; either one alone false-positives on
+// stray data or BB's own overlay relocations:
+//   (a) a believable MIPS prologue (`27BD FFxx`) in the first 0x100 bytes at 0x3F00000, and
+//   (b) a handful of `jal` self-calls into [0x80400000, 0x80800000) inside the blob -
+//       real code calls itself constantly, random data doesn't.
+//
+// The blob is stored either rzip-compressed (header `0x11 0x72`) somewhere in high ROM,
+// or as raw uncompressed MIPS at exactly 0x3F00000 that the boot stub DMA-copies verbatim.
+
+static bool LooksLikeMipsFunctionPrologue(const uint8_t* p) {
+    // addiu $sp, $sp, -N  ->  0x27 0xBD 0xFF 0xxx
+    return p[0] == 0x27 && p[1] == 0xBD && p[2] == 0xFF;
+}
+
+// Count `jal` instructions in [start, start+size) whose target lies in
+// [CUSTOM_CODE_RAM_BASE, CUSTOM_CODE_RAM_END). Returns the count and, via
+// outFirstTarget, the first such target seen (for logging).
+static int CountInternalCustomCodeJals(const std::vector<uint8_t>& rom, uint32_t start, uint32_t size,
+                                       uint32_t& outFirstTarget) {
+    outFirstTarget = 0;
+    int count = 0;
+    uint32_t end = start + size;
+    if (end > rom.size())
+        end = static_cast<uint32_t>(rom.size());
+    for (uint32_t off = start; off + 4 <= end; off += 4) {
+        if (rom[off] != 0x0C)
+            continue; // op=3 (JAL) starts with 0x0C in BE
+        uint32_t word = ReadU32BE(rom.data() + off);
+        if ((word >> 26) != 0x03)
+            continue;
+        uint32_t target = 0x80000000u | ((word & 0x03FFFFFFu) << 2);
+        if (target >= CUSTOM_CODE_RAM_BASE && target < CUSTOM_CODE_RAM_END) {
+            if (count == 0)
+                outFirstTarget = target;
+            count++;
+        }
+    }
+    return count;
+}
+
+// Run the two custom-code signals against a candidate payload. On a hit, fills the
+// out params (SHA1 over the full payload; ramBase = first internal jal target rounded
+// down to 1 MB, which recovers the boot stub's load address closely enough for logging
+// and identification) and returns true.
+static bool CheckCustomCodePayload(const std::vector<uint8_t>& payload, int& outInternalJalCount,
+                                   uint32_t& outFirstInternalTarget, uint32_t& outRamBase, uint8_t outBlobSha1[20]) {
+    bool hasPrologue = false;
+    uint32_t prologueScan = std::min<uint32_t>(static_cast<uint32_t>(payload.size()), 0x100);
+    for (uint32_t p = 0; p + 4 <= prologueScan; p += 4) {
+        if (LooksLikeMipsFunctionPrologue(payload.data() + p)) {
+            hasPrologue = true;
+            break;
+        }
+    }
+    if (!hasPrologue) {
+        return false;
+    }
+
+    uint32_t firstTarget = 0;
+    int jals = CountInternalCustomCodeJals(payload, 0, static_cast<uint32_t>(payload.size()), firstTarget);
+    if (jals < CUSTOM_CODE_MIN_INTERNAL_JALS) {
+        return false;
+    }
+
+    outInternalJalCount = jals;
+    outFirstInternalTarget = firstTarget;
+    outRamBase = firstTarget & ~0xFFFFFu;
+    if (outBlobSha1) {
+        Sha1Into(payload.data(), payload.size(), outBlobSha1);
+    }
+    return true;
+}
+
+// Collect j/jal targets landing in the custom-code RAM window from a decompressed overlay.
+static void CollectExtendedRamJumps(const uint8_t* ovl, uint32_t size, std::vector<uint32_t>& outTargets) {
+    for (uint32_t off = 0; off + 4 <= size; off += 4) {
+        uint32_t w = ReadU32BE(ovl + off);
+        uint32_t op = w >> 26;
+        if (op != 2 && op != 3) {
+            continue;
+        }
+        uint32_t target = 0x80000000u | ((w & 0x03FFFFFFu) << 2);
+        if (target >= CUSTOM_CODE_RAM_BASE && target < CUSTOM_CODE_RAM_END) {
+            outTargets.push_back(target);
+        }
+    }
+}
+
+// Strategy 3: nothing in the 0x3F00000 window at all.
+static bool DetectOverlayHookedCustomCode(const std::vector<uint8_t>& rom, uint32_t& outBlobRomOffset,
+                                          int& outHookCount, uint32_t& outFirstTarget, uint32_t& outRamBase,
+                                          uint8_t outBlobSha1[20]) {
+    uint32_t ovlSize = 0, ovlAddr = 0;
+    uint8_t* ovl = FindPatchedOverlay(rom, ovlSize, ovlAddr);
+    if (ovl == nullptr) {
+        return false;
+    }
+    std::vector<uint32_t> targets;
+    // In-place-patch semantics only
+    if (ovlSize == VANILLA_OVERLAY_SIZE) {
+        CollectExtendedRamJumps(ovl, ovlSize, targets);
+    }
+    free(ovl);
+    if (ovlSize != VANILLA_OVERLAY_SIZE) {
+        return false;
+    }
+
+    // The booted core1 can carry hooks too. Prefer a relocated copy
+    // just before the booted core2; fall back to the vanilla slot.
+    uint32_t c1Addr = 0;
+    uint32_t scanStart = ovlAddr > 0x200000 ? ovlAddr - 0x200000 : 0;
+    for (uint32_t off = scanStart; off + 6 < ovlAddr; off += 4) {
+        if (rom[off] != 0x11 || rom[off + 1] != 0x72) {
+            continue;
+        }
+        if (ReadU32BE(rom.data() + off + 2) == VANILLA_CORE1_SIZE) {
+            c1Addr = off; // keep the last hit (closest to core2)
+        }
+    }
+    if (c1Addr == 0 && VANILLA_CORE1_ROM_OFFSET + 6 < rom.size() && rom[VANILLA_CORE1_ROM_OFFSET] == 0x11 &&
+        rom[VANILLA_CORE1_ROM_OFFSET + 1] == 0x72) {
+        c1Addr = VANILLA_CORE1_ROM_OFFSET;
+    }
+    if (c1Addr != 0) {
+        try {
+            uint32_t sz = 0x100000;
+            uint8_t* c1 = bk_unzip(rom.data() + c1Addr, &sz);
+            if (c1) {
+                if (sz == VANILLA_CORE1_SIZE) {
+                    CollectExtendedRamJumps(c1, sz, targets);
+                }
+                free(c1);
+            }
+        } catch (...) {}
+    }
+
+    if (targets.size() < static_cast<size_t>(CUSTOM_CODE_MIN_INTERNAL_JALS)) {
+        return false;
+    }
+
+    uint32_t minTarget = *std::min_element(targets.begin(), targets.end());
+    uint32_t maxTarget = *std::max_element(targets.begin(), targets.end());
+    uint32_t ramBase = minTarget & ~0xFFFFFu;
+    uint32_t windowEnd = ramBase + 0x100000;
+
+    // Raw ROM words that jump inside the hook window = the blob calling itself.
+    // Cluster them; asset data yields sparse coincidental hits, the blob a dense run.
+    std::vector<uint32_t> hits;
+    for (uint32_t off = 0; off + 4 <= rom.size(); off += 4) {
+        uint32_t w = ReadU32BE(rom.data() + off);
+        uint32_t op = w >> 26;
+        if (op != 2 && op != 3) {
+            continue;
+        }
+        uint32_t t = 0x80000000u | ((w & 0x03FFFFFFu) << 2);
+        if (t >= ramBase && t < windowEnd) {
+            hits.push_back(off);
+        }
+    }
+    std::vector<std::pair<uint32_t, uint32_t>> clusters; // index range into hits
+    for (uint32_t i = 0; i < hits.size(); i++) {
+        if (!clusters.empty() && hits[i] - hits[clusters.back().second] < 0x4000) {
+            clusters.back().second = i;
+        } else {
+            clusters.push_back({ i, i });
+        }
+    }
+    std::sort(clusters.begin(), clusters.end(),
+              [](const auto& a, const auto& b) { return (a.second - a.first) > (b.second - b.first); });
+
+    auto pageLive = [&rom](uint32_t p) {
+        if (p + 0x1000 > rom.size()) {
+            return false;
+        }
+        for (uint32_t i = 0; i < 0x1000; i++) {
+            uint8_t b = rom[p + i];
+            if (b != 0x00 && b != 0xFF) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    for (size_t c = 0; c < clusters.size() && c < 4; c++) {
+        // Page-expand the cluster to the full non-padding extent, trim trailing pad.
+        uint32_t start = hits[clusters[c].first] & ~0xFFFu;
+        while (start >= 0x1000 && pageLive(start - 0x1000)) {
+            start -= 0x1000;
+        }
+        uint32_t end = (hits[clusters[c].second] + 0xFFF) & ~0xFFFu;
+        while (end < rom.size() && pageLive(end)) {
+            end += 0x1000;
+        }
+        end = std::min<uint32_t>(end, static_cast<uint32_t>(rom.size()));
+        while (end > start && (rom[end - 1] == 0x00 || rom[end - 1] == 0xFF)) {
+            end--;
+        }
+        uint32_t len = end - start;
+        if (len < 0x100 || len > 0x200000) {
+            continue;
+        }
+        // The store must cover every hook target, and the targets must land on
+        // code rather than padding.
+        if (len < maxTarget - ramBase + 4) {
+            continue;
+        }
+        int live = 0;
+        for (uint32_t t : targets) {
+            uint32_t off = start + (t - ramBase);
+            if (off + 4 <= end && ReadU32BE(rom.data() + off) != 0) {
+                live++;
+            }
+        }
+        if (live * 2 < static_cast<int>(targets.size())) {
+            continue;
+        }
+        bool prologue = false;
+        for (uint32_t off = start; off + 4 <= end && !prologue; off += 4) {
+            prologue = LooksLikeMipsFunctionPrologue(rom.data() + off);
+        }
+        if (!prologue) {
+            continue;
+        }
+
+        outBlobRomOffset = start;
+        outHookCount = static_cast<int>(targets.size());
+        outFirstTarget = minTarget;
+        outRamBase = ramBase;
+        if (outBlobSha1) {
+            Sha1Into(rom.data() + start, len, outBlobSha1);
+        }
+        SPDLOG_WARN("[ConfigFactory] Overlay-hooked custom code: {} overlay hooks into RAM 0x{:08X}+, raw blob "
+                    "at ROM 0x{:X} ({} bytes)",
+                    targets.size(), ramBase, start, len);
+        return true;
+    }
+
+    // Hooks exist but the store eluded the scan. Identify the hack by its sorted
+    // hook-target signature so the port still gets a stable id and the user still
+    // gets the custom-code warning.
+    std::sort(targets.begin(), targets.end());
+    std::vector<uint8_t> sig;
+    sig.reserve(targets.size() * 4);
+    for (uint32_t t : targets) {
+        PushBE(sig, t, 4);
+    }
+    if (outBlobSha1) {
+        Sha1Into(sig.data(), sig.size(), outBlobSha1);
+    }
+    outBlobRomOffset = 0;
+    outHookCount = static_cast<int>(targets.size());
+    outFirstTarget = minTarget;
+    outRamBase = ramBase;
+    SPDLOG_WARN("[ConfigFactory] Overlay-hooked custom code: {} overlay hooks into RAM 0x{:08X}+ but no backing "
+                "blob located; identifying by hook signature",
+                targets.size(), ramBase);
+    return true;
+}
+
+// On success, also writes the decompressed-payload SHA1 to outBlobSha1.
+// Hash is written to cleanly identify the particular blob so Lighthouse can
+// act on it.
+static bool DetectCustomCodeBlob(const std::vector<uint8_t>& rom, uint32_t& outBlobRomOffset, int& outInternalJalCount,
+                                 uint32_t& outFirstInternalTarget, uint32_t& outRamBase, CustomCodeKind& outKind,
+                                 uint8_t outBlobSha1[20]) {
+    outBlobRomOffset = 0;
+    outInternalJalCount = 0;
+    outFirstInternalTarget = 0;
+    outRamBase = 0;
+    outKind = CustomCodeKind::NONE;
+    if (outBlobSha1) {
+        std::memset(outBlobSha1, 0, 20);
+    }
+
+    if (rom.size() < CUSTOM_CODE_ROM_OFFSET) {
+        return false;
+    }
+
+    // Walk every rzip blob in the high-ROM region and check if
+    // its decompressed contents look like the custom-code blob.
+    for (uint32_t off = CUSTOM_CODE_ROM_OFFSET; off + 6 <= rom.size(); off += 4) {
+        if (rom[off] != 0x11 || rom[off + 1] != 0x72) {
+            continue;
+        }
+        uint32_t expectedSize = ReadU32BE(rom.data() + off + 2);
+        // Plausible size for an injected custom-code blob: ~10 KB to ~1 MB.
+        if (expectedSize < 0x4000 || expectedSize > 0x100000) {
+            continue;
+        }
+
+        uint8_t* unzipped = nullptr;
+        uint32_t unzippedSize = expectedSize;
+        try {
+            unzipped = bk_unzip(rom.data() + off, &unzippedSize);
+        } catch (...) { continue; }
+        if (!unzipped || unzippedSize != expectedSize) {
+            if (unzipped)
+                free(unzipped);
+            continue;
+        }
+
+        std::vector<uint8_t> payload(unzipped, unzipped + unzippedSize);
+        free(unzipped);
+        if (!CheckCustomCodePayload(payload, outInternalJalCount, outFirstInternalTarget, outRamBase, outBlobSha1)) {
+            continue;
+        }
+        outBlobRomOffset = off;
+        outKind = CustomCodeKind::BB_INJECTED;
+        return true;
+    }
+
+    // No compressed blob found; try a raw uncompressed blob at 0x3F00000.
+    if (rom.size() > CUSTOM_CODE_ROM_OFFSET + 4) {
+        uint32_t windowEnd =
+            static_cast<uint32_t>(std::min<size_t>(rom.size(), CUSTOM_CODE_ROM_OFFSET + CUSTOM_CODE_RAW_MAX_SIZE));
+        uint32_t rawSize = windowEnd - CUSTOM_CODE_ROM_OFFSET;
+        while (rawSize > 0 && rom[CUSTOM_CODE_ROM_OFFSET + rawSize - 1] == 0xFF) {
+            rawSize--;
+        }
+        if (rawSize >= 0x4000) {
+            std::vector<uint8_t> payload(rom.begin() + CUSTOM_CODE_ROM_OFFSET,
+                                         rom.begin() + CUSTOM_CODE_ROM_OFFSET + rawSize);
+            if (CheckCustomCodePayload(payload, outInternalJalCount, outFirstInternalTarget, outRamBase, outBlobSha1)) {
+                outBlobRomOffset = CUSTOM_CODE_ROM_OFFSET;
+                outKind = CustomCodeKind::BB_GLOBALIZATION;
+                return true;
+            }
+        }
+    }
+
+    // Strategy 3: nothing in the standard window; look for hooks baked into the
+    // booted overlays and chase them to the store.
+    if (DetectOverlayHookedCustomCode(rom, outBlobRomOffset, outInternalJalCount, outFirstInternalTarget, outRamBase,
+                                      outBlobSha1)) {
+        outKind = CustomCodeKind::BB_INJECTED;
+        return true;
+    }
+
+    return false;
+}
+
+RomhackKind ClassifyRomhack(const std::vector<uint8_t>& rom) {
+    if (rom.size() <= 0x1000000) {
+        return RomhackKind::NotRomhack;
+    }
+
+    // No BK boot overlay reachable via the EOR pointers means this probably isn't a
+    // BK-derived ROM at all.
+    uint32_t ovlSize = 0, ovlAddr = 0;
+    uint8_t* ovl = FindPatchedOverlay(rom, ovlSize, ovlAddr);
+    if (ovl == nullptr) {
+        return RomhackKind::UnknownRom;
+    }
+    free(ovl);
+
+    // A vanilla-sized overlay means BB's in-place patching, so fixed offsets are
+    // valid. Don't check where the blob lives; BB relocates it, and some builds
+    // reuse the freed 0xF37F90 region.
+    if (ovlSize != VANILLA_OVERLAY_SIZE) {
+        return RomhackKind::CustomBuild;
+    }
+
+    return RomhackKind::BBRomhack;
+}
+
+// Public wrapper: thin bool-returning view used by Lighthouse to gate UI before
+// running the rest of extraction. Same detection logic as DetectCustomCodeBlob
+// above; we discard the returned metadata for callers that just want a yes/no.
+bool GetCustomCodeBlobInfo(const std::vector<uint8_t>& rom, CustomCodeKind& outKind, char outSha1Hex[41]) {
+    uint32_t blobRom = 0, firstTarget = 0, ramBase = 0;
+    int jalCount = 0;
+    uint8_t sha1[20] = {};
+    outKind = CustomCodeKind::NONE;
+    outSha1Hex[0] = '\0';
+    if (!DetectCustomCodeBlob(rom, blobRom, jalCount, firstTarget, ramBase, outKind, sha1)) {
+        return false;
+    }
+    Sha1HexString(sha1, outSha1Hex);
+    return true;
+}
+
+bool HasCustomCodeBlob(const std::vector<uint8_t>& rom) {
+    uint32_t blobRom = 0, firstTarget = 0, ramBase = 0;
+    int jalCount = 0;
+    CustomCodeKind kind = CustomCodeKind::NONE;
+    if (DetectCustomCodeBlob(rom, blobRom, jalCount, firstTarget, ramBase, kind, nullptr)) {
+        return kind == CustomCodeKind::BB_INJECTED;
+    }
+    return ClassifyRomhack(rom) == RomhackKind::CustomBuild;
+}
+
+// Main entry point
+
+std::vector<char> BuildGameConfigBlob(const std::vector<uint8_t>& rom, const std::string& romName) {
+    const RomhackKind kind = ClassifyRomhack(rom);
+    if (kind == RomhackKind::NotRomhack || kind == RomhackKind::UnknownRom) {
+        return {};
+    }
+
+    // Look for injected custom MIPS code.
+    uint32_t customCodeBlobRom = 0;
+    uint32_t customCodeFirstTarget = 0;
+    uint32_t customCodeRamBase = 0;
+    int customCodeJalCount = 0;
+    CustomCodeKind customCodeKind = CustomCodeKind::NONE;
+    uint8_t customCodeSha1[20] = {};
+    bool hasCustomCode = DetectCustomCodeBlob(rom, customCodeBlobRom, customCodeJalCount, customCodeFirstTarget,
+                                              customCodeRamBase, customCodeKind, customCodeSha1);
+    if (hasCustomCode) {
+        char hex[41];
+        Sha1HexString(customCodeSha1, hex);
+        if (customCodeKind == CustomCodeKind::BB_INJECTED) {
+            SPDLOG_WARN("[ConfigFactory] Injected custom MIPS code detected at ROM 0x{:X}; {} internal jal "
+                        "self-references seen, first target 0x{:08X}; sha1={}.",
+                        customCodeBlobRom, customCodeJalCount, customCodeFirstTarget, hex);
+            SPDLOG_WARN("[ConfigFactory] This romhack ships custom code.  Lighthouse runs the decompiled C "
+                        "source and cannot execute injected code, so scripted behavior driven by that code "
+                        "will be silently absent until a port is implemented.");
+        } else {
+            SPDLOG_INFO("[ConfigFactory] BB globalized-overlay blob at ROM 0x{:X} ({} internal jals, "
+                        "ramBase 0x{:08X}); sha1={}.",
+                        customCodeBlobRom, customCodeJalCount, customCodeRamBase, hex);
+        }
+    }
+
+    // Find patched overlay
+    uint32_t overlaySize = 0, f37RomAddr = 0;
+    uint8_t* overlay = nullptr;
+    if (kind == RomhackKind::BBRomhack) {
+        overlay = FindPatchedOverlay(rom, overlaySize, f37RomAddr);
+        if (!overlay)
+            return {};
+        SPDLOG_INFO("[ConfigFactory] Found patched overlay at ROM 0x{:X} ({} bytes)", f37RomAddr, overlaySize);
+    } else {
+        SPDLOG_WARN("[ConfigFactory] This romhack was not built with Banjo's Backpack and must be ported.");
+    }
+
+    BlobWriter blob;
+    uint16_t sectionCount = 0;
+
+    // Write header (magic + version + placeholder section count + romName)
+    blob.writeU32(GAMECONFIG_MAGIC);
+    blob.writeU16(GAMECONFIG_VERSION);
+    size_t sectionCountPos = blob.data.size();
+    blob.writeU16(0); // placeholder
+
+    // Write rom name (u8 len + chars, no null terminator)
+    uint8_t nameLen = static_cast<uint8_t>(std::min(romName.size(), size_t(255)));
+    blob.writeU8(nameLen);
+    for (uint8_t i = 0; i < nameLen; i++) {
+        blob.writeU8(static_cast<uint8_t>(romName[i]));
+    }
+
+    // Section: CUSTOM_CODE
+    if (hasCustomCode) {
+        // entry_count is informational here; the section always carries a single
+        // {ramBase, sha1[20]} payload. Use 1 so anyone walking entries lands sanely.
+        size_t secPos = blob.beginSection(ConfigSectionType::CUSTOM_CODE);
+        blob.writeU32(customCodeRamBase);
+        for (int i = 0; i < 20; i++) {
+            blob.writeU8(customCodeSha1[i]);
+        }
+        blob.patchU16(secPos, 1);
+        sectionCount++;
+
+        // Section: CUSTOM_CODE_INFO
+        size_t infoPos = blob.beginSection(ConfigSectionType::CUSTOM_CODE_INFO);
+        blob.writeU16(static_cast<uint16_t>(customCodeKind));
+        blob.writeU16(0); // pad
+        blob.patchU16(infoPos, 1);
+        sectionCount++;
+    }
+
+    // Section: ROM_HASH (data-only romhack identifier)
+    {
+        std::string romHash = Companion::Instance->GetCartridge()->GetHash();
+        // GetHash() returns 40 lowercase hex chars; convert back to 20 raw bytes.
+        if (romHash.size() == 40) {
+            size_t secPos = blob.beginSection(ConfigSectionType::ROM_HASH);
+            for (int i = 0; i < 20; i++) {
+                uint8_t byte = 0;
+                for (int n = 0; n < 2; n++) {
+                    char c = romHash[i * 2 + n];
+                    uint8_t nib = (c >= '0' && c <= '9')   ? c - '0'
+                                  : (c >= 'a' && c <= 'f') ? c - 'a' + 10
+                                  : (c >= 'A' && c <= 'F') ? c - 'A' + 10
+                                                           : 0;
+                    byte = (byte << 4) | nib;
+                }
+                blob.writeU8(byte);
+            }
+            blob.patchU16(secPos, 1);
+            sectionCount++;
+            SPDLOG_INFO("[ConfigFactory] ROM_HASH = {}", romHash);
+        } else {
+            SPDLOG_WARN("[ConfigFactory] ROM hash unexpected length {}, skipping ROM_HASH section", romHash.size());
+        }
+    }
+
+    // Section: CODE_CONSTANTS
+    if (overlay != nullptr) {
+        size_t secPos = blob.beginSection(ConfigSectionType::CODE_CONSTANTS);
+        uint16_t count = 0;
+
+        for (int i = 0; i < static_cast<int>(CodeConstantKey::COUNT); i++) {
+            const auto& entry = sBBConfigs[i];
+            if (entry.offset + 2 > overlaySize)
+                continue;
+
+            uint16_t val = entry.isByte ? overlay[entry.offset] : ReadU16BE(overlay + entry.offset);
+            if (val != entry.vanilla) {
+                blob.writeU16(static_cast<uint16_t>(i));
+                blob.writeU16(val);
+                count++;
+                SPDLOG_INFO("[ConfigFactory] code_const[{}] = {} (vanilla: {})", i, val, entry.vanilla);
+            }
+        }
+
+        if (count > 0) {
+            blob.patchU16(secPos, count);
+            sectionCount++;
+        } else {
+            blob.data.resize(secPos - 2); // remove empty section header
+        }
+    }
+
+    // F9CAE0 sections
+    if (f37RomAddr > 0) {
+        uint32_t modSize = 0, vanSize = 0x100000;
+        uint8_t* modF9 = FindRelocatedF9CAE0(rom, f37RomAddr, modSize);
+
+        // Vanilla F9CAE0 at original location
+        uint8_t* vanF9 = TryUnzipAt(rom, VANILLA_F9CAE0, &vanSize);
+
+        // Some hacks relocate F9CAE0 and overwrite the stock copy,
+        // so there is no vanilla reference in the ROM to diff against.
+        const bool haveVanF9 = (vanF9 != nullptr && modSize == vanSize);
+        if (modF9 && (haveVanF9 || vanF9 == nullptr)) {
+            uint32_t f9Size = modSize;
+            if (!haveVanF9) {
+                SPDLOG_WARN("[ConfigFactory] No vanilla F9CAE0 in this ROM (stock copy at 0x{:X} was overwritten); "
+                            "emitting all F9CAE0-derived entries instead of only differing ones.",
+                            VANILLA_F9CAE0);
+            }
+
+            // Section 2: SCENE_REMAP (D_8036B810 at offset 0x8288)
+            if (f9Size > 0x8288 + 155 * 8) {
+                size_t secPos = blob.beginSection(ConfigSectionType::SCENE_REMAP);
+                uint16_t count = 0;
+
+                for (uint32_t off = 0x8288; off + 4 <= f9Size; off += 8) {
+                    uint16_t mapId = ReadU16BE(modF9 + off);
+                    if (mapId == 0 && off > 0x8288 + 8)
+                        break;
+                    if (mapId == 0)
+                        continue;
+
+                    uint16_t modLevel = ReadU16BE(modF9 + off + 2);
+                    uint16_t vanLevel = haveVanF9 ? ReadU16BE(vanF9 + off + 2) : 0;
+                    if (!haveVanF9 || modLevel != vanLevel) {
+                        blob.writeU16(mapId);
+                        blob.writeU16(modLevel);
+                        count++;
+                        SPDLOG_INFO("[ConfigFactory] scene_remap: map 0x{:X} level {} -> {}", mapId, vanLevel,
+                                    modLevel);
+                    }
+                }
+
+                if (count > 0) {
+                    blob.patchU16(secPos, count);
+                    sectionCount++;
+                } else {
+                    blob.data.resize(secPos - 2);
+                }
+            }
+
+            // Section 3: RETURN_TO_LAIR (D_8036C560 at offset 0x8FD0)
+            if (f9Size > 0x8FD0 + 11 * 4) {
+                size_t secPos = blob.beginSection(ConfigSectionType::RETURN_TO_LAIR);
+                uint16_t count = 0;
+
+                for (int i = 0; i < 11; i++) {
+                    uint32_t off = 0x8FD0 + i * 4;
+                    uint16_t modMap = ReadU16BE(modF9 + off);
+                    uint16_t modExit = ReadU16BE(modF9 + off + 2);
+                    uint16_t vanMap = haveVanF9 ? ReadU16BE(vanF9 + off) : 0;
+                    uint16_t vanExit = haveVanF9 ? ReadU16BE(vanF9 + off + 2) : 0;
+                    if (!haveVanF9 || modMap != vanMap || modExit != vanExit) {
+                        blob.writeU8(static_cast<uint8_t>(i));
+                        blob.writeU8(0); // pad
+                        blob.writeU16(modMap);
+                        blob.writeU16(modExit);
+                        count++;
+                        SPDLOG_INFO("[ConfigFactory] return_to_lair[{}]: 0x{:X}/0x{:X} -> "
+                                    "0x{:X}/0x{:X}",
+                                    i, vanMap, vanExit, modMap, modExit);
+                    }
+                }
+
+                if (count > 0) {
+                    blob.patchU16(secPos, count);
+                    sectionCount++;
+                } else {
+                    blob.data.resize(secPos - 2);
+                }
+            }
+
+            // Section 4: MUSIC (offset 0xA8F0)
+            if (f9Size > 0xA8F0 + 8) {
+                size_t secPos = blob.beginSection(ConfigSectionType::MUSIC);
+                uint16_t count = 0;
+
+                for (uint32_t off = 0xA8F0; off + 8 <= f9Size; off += 8) {
+                    uint16_t mapId = ReadU16BE(modF9 + off);
+                    if (mapId == 0 && off > 0xA8F0 + 8)
+                        break;
+                    if (mapId == 0)
+                        continue;
+
+                    bool differs = !haveVanF9 || memcmp(modF9 + off, vanF9 + off, 8) != 0;
+                    if (differs) {
+                        blob.writeU16(mapId);
+                        blob.writeU16(ReadU16BE(modF9 + off + 2));
+                        blob.writeU16(ReadU16BE(modF9 + off + 4));
+                        count++;
+                    }
+                }
+
+                if (count > 0) {
+                    blob.patchU16(secPos, count);
+                    sectionCount++;
+                } else {
+                    blob.data.resize(secPos - 2);
+                }
+            }
+
+            // Section 5: SKYBOX (offset 0x87B0, 40-byte entries)
+            // Full 3-layer extraction: scene_id + 3x {model_id, scale(f32 as LE u32),
+            // rotation(f32 as LE u32)} MapSkyInfo layout in F9CAE0 (MIPS BE, 40
+            // bytes):
+            //   +0:  s16 map (BE)
+            //   +4:  s16 model1 (BE), +8: f32 scale1 (BE), +12: f32 rot1 (BE)
+            //   +16: s16 model2 (BE), +20: f32 scale2 (BE), +24: f32 rot2 (BE)
+            //   +28: s16 model3 (BE), +32: f32 scale3 (BE), +36: f32 rot3 (BE)
+            if (f9Size > 0x87B0 + 40) {
+                size_t secPos = blob.beginSection(ConfigSectionType::SKYBOX);
+                uint16_t count = 0;
+                std::vector<uint16_t> hackMaps;
+
+                for (uint32_t off = 0x87B0; off + 40 <= f9Size; off += 40) {
+                    uint16_t sceneId = ReadU16BE(modF9 + off);
+                    if (sceneId == 0 && off > 0x87B0 + 40)
+                        break;
+                    if (sceneId == 0)
+                        continue;
+                    hackMaps.push_back(sceneId);
+
+                    bool differs = !haveVanF9 || memcmp(modF9 + off, vanF9 + off, 40) != 0;
+                    if (differs) {
+                        blob.writeU16(sceneId);
+                        // 3 layers: model (s16 LE), scale (f32 as u32 LE), rotation (f32 as
+                        // u32 LE)
+                        for (int layer = 0; layer < 3; layer++) {
+                            uint32_t base = off + 4 + layer * 12;
+                            blob.writeS16(static_cast<int16_t>(ReadU16BE(modF9 + base))); // model_id
+                            blob.writeU32(ReadU32BE(modF9 + base + 4)); // scale (BE f32 bits -> LE u32)
+                            blob.writeU32(ReadU32BE(modF9 + base + 8)); // rotation (BE f32 bits -> LE u32)
+                        }
+                        count++;
+                        SPDLOG_INFO("[ConfigFactory] skybox: scene 0x{:X} models [{},{},{}]", sceneId,
+                                    ReadU16BE(modF9 + off + 4), ReadU16BE(modF9 + off + 16),
+                                    ReadU16BE(modF9 + off + 28));
+                    }
+                }
+
+                // A hack can also *remove* a map from the table (rekeying its slot to
+                // a new map). Diff-only emission would leave the port falling back
+                // to its built-in vanilla table and drawing a sky the hack deleted.
+                // An all-zero entry makes the runtime override resolve to "no skybox".
+                for (uint32_t off = 0x87B0; haveVanF9 && off + 40 <= f9Size; off += 40) {
+                    uint16_t vanId = ReadU16BE(vanF9 + off);
+                    if (vanId == 0 && off > 0x87B0 + 40)
+                        break;
+                    if (vanId == 0)
+                        continue;
+                    if (std::find(hackMaps.begin(), hackMaps.end(), vanId) != hackMaps.end())
+                        continue;
+                    blob.writeU16(vanId);
+                    for (int layer = 0; layer < 3; layer++) {
+                        blob.writeS16(0);
+                        blob.writeU32(0);
+                        blob.writeU32(0);
+                    }
+                    count++;
+                    SPDLOG_INFO("[ConfigFactory] skybox: scene 0x{:X} removed by hack -> none", vanId);
+                }
+
+                if (count > 0) {
+                    blob.patchU16(secPos, count);
+                    sectionCount++;
+                } else {
+                    blob.data.resize(secPos - 2);
+                }
+            }
+
+            // Section 6: SCENE_DEF (offset 0x7650, 24-byte MIPS entries)
+            // MapModelDescription: {s16 map, s16 opa, s16 xlu, s16 min[3], s16
+            // max[3], pad[2], f32 scale}
+            if (f9Size > 0x7650 + 24) {
+                size_t secPos = blob.beginSection(ConfigSectionType::SCENE_DEF);
+                uint16_t count = 0;
+
+                for (uint32_t off = 0x7650; off + 24 <= f9Size; off += 24) {
+                    uint16_t sceneId = ReadU16BE(modF9 + off);
+                    if (sceneId == 0 && off > 0x7650 + 24)
+                        break;
+                    if (sceneId == 0)
+                        continue;
+
+                    bool differs = !haveVanF9 || memcmp(modF9 + off, vanF9 + off, 24) != 0;
+                    if (differs) {
+                        blob.writeU16(sceneId);
+                        blob.writeS16(static_cast<int16_t>(ReadU16BE(modF9 + off + 2))); // opa
+                        blob.writeS16(static_cast<int16_t>(ReadU16BE(modF9 + off + 4))); // xlu
+                        for (int b = 0; b < 3; b++) {
+                            blob.writeS16(static_cast<int16_t>(ReadU16BE(modF9 + off + 6 + b * 2))); // min[3]
+                        }
+                        for (int b = 0; b < 3; b++) {
+                            blob.writeS16(static_cast<int16_t>(ReadU16BE(modF9 + off + 12 + b * 2))); // max[3]
+                        }
+                        blob.writeU32(ReadU32BE(modF9 + off + 20)); // scale (BE f32 bits -> LE u32)
+                        count++;
+                    }
+                }
+
+                if (count > 0) {
+                    blob.patchU16(secPos, count);
+                    sectionCount++;
+                } else {
+                    blob.data.resize(secPos - 2);
+                }
+            }
+
+            // Section 9: LEVEL_NAMES (F9CAE0 offset 86068-86302, null-terminated
+            // ASCII)
+            if (f9Size > 86302) {
+                size_t secPos = blob.beginSection(ConfigSectionType::LEVEL_NAMES);
+                uint16_t count = 0;
+
+                // Parse the same way BB does: scan for null-terminated strings
+                int nameIdx = 0;
+                uint32_t nameStart = 0;
+                for (uint32_t off = 86068; off < 86302 && nameIdx < 13; off++) {
+                    if (modF9[off] == 0) {
+                        if (nameStart > 0) {
+                            // Compare against vanilla
+                            uint32_t len = off - nameStart;
+                            std::string modName(reinterpret_cast<char*>(modF9 + nameStart), len);
+                            bool differs = (nameIdx >= 13) || (modName != sVanillaLevelNames[nameIdx]);
+                            if (differs) {
+                                blob.writeU8(static_cast<uint8_t>(nameIdx));
+                                blob.writeU8(static_cast<uint8_t>(len));
+                                for (uint32_t c = 0; c < len; c++) {
+                                    blob.writeU8(modF9[nameStart + c]);
+                                }
+                                count++;
+                                SPDLOG_INFO("[ConfigFactory] level_name[{}] = \"{}\"", nameIdx, modName);
+                            }
+                            nameIdx++;
+                            nameStart = 0;
+                        }
+                    } else {
+                        if (nameStart == 0) {
+                            nameStart = off;
+                        }
+                    }
+                }
+
+                if (count > 0) {
+                    blob.patchU16(secPos, count);
+                    sectionCount++;
+                } else {
+                    blob.data.resize(secPos - 2);
+                }
+            }
+            // Section 10: WARP_DESTINATIONS
+            // BB stores a warp function pointer table in F9CAE0 at offset 0xC3F0
+            // (558 entries, 4 bytes each). Each points to a warp function in the
+            // F37F90 code overlay. Decompress the vanilla overlay from its
+            // original ROM location, scan both copies for the ADDIU $a1 dest
+            // pattern, and emit diffs.
+            {
+                uint32_t vanOvlSize = 0;
+                uint8_t* vanOvl = TryUnzipAt(rom, VANILLA_F37F90_OFFSET, &vanOvlSize);
+
+                // With a vanilla reference we emit only warps whose destination changed.
+                // Without one, the hack's own F9CAE0 still holds a valid warp function
+                // table pointing into its overlay, so resolve and emit them all.
+                const bool warpDiffMode = (haveVanF9 && vanOvl != nullptr);
+                const uint8_t* warpF9 = haveVanF9 ? vanF9 : modF9;
+                if ((warpDiffMode || !haveVanF9) && f9Size > WARP_TABLE_OFF + WARP_ENTRY_COUNT * 4) {
+                    size_t secPos = blob.beginSection(ConfigSectionType::WARP_DESTINATIONS);
+                    uint16_t count = 0;
+
+                    const std::vector<uint32_t> funcOffs = CollectWarpFuncOffsets(warpF9);
+
+                    uint32_t scanSize = warpDiffMode ? std::min(vanOvlSize, overlaySize) : overlaySize;
+                    for (int w = 0; w < WARP_ENTRY_COUNT; w++) {
+                        uint32_t tOff = WARP_TABLE_OFF + w * 4;
+                        uint32_t addr = ReadU32BE(warpF9 + tOff);
+                        if (addr < N64_OVL_BASE) {
+                            continue;
+                        }
+                        uint32_t funcOff = addr - N64_OVL_BASE;
+
+                        auto next = std::upper_bound(funcOffs.begin(), funcOffs.end(), funcOff);
+                        uint32_t funcLen = (next != funcOffs.end()) ? (*next - funcOff) : 200;
+
+                        int vanDest = -1, modDest = -1;
+                        bool emit;
+                        if (warpDiffMode) {
+                            emit = ScanWarpDestDiff(vanOvl, overlay, funcOff, funcLen, scanSize, vanDest, modDest);
+                        } else {
+                            // No in-ROM vanilla table to diff against (relocated F9CAE0):
+                            // compare against the vanilla destinations from hashes.yaml.
+                            vanDest = GetVanillaWarpDest(static_cast<uint32_t>(w));
+                            emit = ScanWarpDestOnly(overlay, funcOff, funcLen, scanSize, modDest) && modDest != vanDest;
+                        }
+                        if (emit) {
+                            blob.writeU16(static_cast<uint16_t>(w));
+                            blob.writeU16(static_cast<uint16_t>(modDest));
+                            count++;
+                            SPDLOG_INFO("[ConfigFactory] warp[{}]: 0x{:04X} -> 0x{:04X}", w, vanDest, modDest);
+                        }
+                    }
+
+                    if (count > 0) {
+                        blob.patchU16(secPos, count);
+                        sectionCount++;
+                    } else {
+                        blob.data.resize(secPos - 2);
+                    }
+                } else if (warpDiffMode && !vanOvl) {
+                    SPDLOG_WARN("[ConfigFactory] Could not decompress vanilla F37F90 overlay for warp diff");
+                }
+
+                if (vanOvl) {
+                    free(vanOvl);
+                }
+            }
+        } else if (modF9 && vanF9) {
+            SPDLOG_WARN("[ConfigFactory] F9CAE0 size mismatch: modified={} vanilla={}", modSize, vanSize);
+        }
+
+        if (modF9)
+            free(modF9);
+        if (vanF9)
+            free(vanF9);
+    }
+
+    free(overlay);
+
+    // FCF698 sections (lair overlay objects, uncompressed in globalized blob)
+    if (kind == RomhackKind::BBRomhack && rom.size() > FCF698_ROM_OFFSET + FCF698_SIZE) {
+        const uint8_t* fcf = rom.data() + FCF698_ROM_OFFSET;
+
+        // A fully zeroed region means this build doesn't globalize the FCF698 data.
+        bool regionPresent = std::any_of(fcf, fcf + FCF698_SIZE, [](uint8_t b) { return b != 0; });
+        if (!regionPresent) {
+            SPDLOG_WARN("[ConfigFactory] FCF698 region is zeroed; skipping note door / jiggy puzzle sections");
+        }
+
+        // Validate: first note door value should be a reasonable u16 (0-10000)
+        uint16_t firstDoor = ReadU16BE(fcf + FCF698_NOTE_DOORS_OFF);
+        if (regionPresent && firstDoor <= 10000) {
+            // Section 7: NOTE_DOORS
+            {
+                size_t secPos = blob.beginSection(ConfigSectionType::NOTE_DOORS);
+                uint16_t count = 0;
+
+                for (int i = 0; i < 12; i++) {
+                    uint16_t val = ReadU16BE(fcf + FCF698_NOTE_DOORS_OFF + i * 2);
+                    if (val != sVanillaNoteDoors[i]) {
+                        blob.writeU8(static_cast<uint8_t>(i));
+                        blob.writeU8(0); // pad
+                        blob.writeU16(val);
+                        count++;
+                        SPDLOG_INFO("[ConfigFactory] note_door[{}] = {} (vanilla: {})", i, val, sVanillaNoteDoors[i]);
+                    }
+                }
+
+                if (count > 0) {
+                    blob.patchU16(secPos, count);
+                    sectionCount++;
+                } else {
+                    blob.data.resize(secPos - 2);
+                }
+            }
+
+            // Section 8: JIGGY_PUZZLES
+            {
+                size_t secPos = blob.beginSection(ConfigSectionType::JIGGY_PUZZLES);
+                uint16_t count = 0;
+
+                for (int i = 0; i < 11; i++) {
+                    uint8_t cost = fcf[FCF698_JIGGY_PUZZLES_OFF + i * 4];
+                    uint8_t size = fcf[FCF698_JIGGY_PUZZLES_OFF + i * 4 + 1];
+                    uint16_t flag = ReadU16BE(fcf + FCF698_JIGGY_PUZZLES_OFF + i * 4 + 2);
+                    if (cost != sVanillaJiggyCosts[i] || size != sVanillaJiggySizes[i] ||
+                        flag != sVanillaJiggyFlags[i]) {
+                        blob.writeU8(static_cast<uint8_t>(i));
+                        blob.writeU8(cost);
+                        blob.writeU8(size);
+                        blob.writeU8(0); // pad
+                        blob.writeU16(flag);
+                        count++;
+                        SPDLOG_INFO("[ConfigFactory] jiggy_puzzle[{}] = cost {} size {} flag {:#x} "
+                                    "(vanilla: {}/{}/{:#x})",
+                                    i, cost, size, flag, sVanillaJiggyCosts[i], sVanillaJiggySizes[i],
+                                    sVanillaJiggyFlags[i]);
+                    }
+                }
+
+                if (count > 0) {
+                    blob.patchU16(secPos, count);
+                    sectionCount++;
+                } else {
+                    blob.data.resize(secPos - 2);
+                }
+            }
+        } else if (regionPresent) {
+            SPDLOG_WARN("[ConfigFactory] FCF698 validation failed: first door value "
+                        "{} out of range",
+                        firstDoor);
+        }
+    }
+
+    // Patch section count
+    blob.patchU16(sectionCountPos, sectionCount);
+
+    if (sectionCount == 0) {
+        return {};
+    }
+
+    SPDLOG_INFO("[ConfigFactory] Built aGameConfig blob: {} bytes, {} sections", blob.data.size(), sectionCount);
+    return blob.data;
+}
+
+static const char* const sCodeConstantNames[] = {
+    "NEW_GAME_MAP",      "START_LEVEL_1",           "START_LEVEL_2",
+    "KNOW_ALL_MOVES",    "MUMBO_COST_TERMITE",      "MUMBO_COST_CROC",
+    "MUMBO_COST_WALRUS", "MUMBO_COST_PUMPKIN",      "MUMBO_COST_BEE",
+    "EGGS_NORMAL_MAX",   "RED_FEATHERS_NORMAL_MAX", "GOLD_FEATHERS_NORMAL_MAX",
+    "EGGS_CHEATO_MAX",   "RED_FEATHERS_CHEATO_MAX", "GOLD_FEATHERS_CHEATO_MAX",
+    "NOTES_MAX",         "JIGGIES_PER_WORLD",       "HONEYCOMBS_PER_WORLD",
+    "EXTRA_HC_START",    "WARP_EXIT_BANJOS_HOUSE",  "WARP_ENTER_LAIR",
+    "SPECIAL_LEVEL",     "HIDE_JIGGIES_LEVEL",      "HIDE_COLLECTIBLES_LEVEL",
+};
+static_assert(sizeof(sCodeConstantNames) / sizeof(sCodeConstantNames[0]) == static_cast<int>(CodeConstantKey::COUNT));
+
+// KNOW_ALL_MOVES's patched instruction halfword. Lighthouse only checks the key is there.
+static constexpr uint16_t KNOW_ALL_MOVES_ON = 0x0F98;
+// Pictures past these two place their pieces one at a time.
+static constexpr int PUZZLE_MASK_PICTURES = 9;
+static constexpr int PUZZLE_MASK_PIECES = 32;
+static constexpr int PUZZLE_COUNT = 11;
+static constexpr int NOTE_DOOR_COUNT = 12;
+static constexpr int TITLE_COUNT = 13;
+
+const char* CodeConstantName(uint16_t key) {
+    return key < static_cast<uint16_t>(CodeConstantKey::COUNT) ? sCodeConstantNames[key] : nullptr;
+}
+
+namespace {
+struct BlobReader {
+    const std::vector<char>& data;
+    size_t pos = 0;
+    bool ok = true;
+
+    uint8_t u8() {
+        if (pos >= data.size()) {
+            ok = false;
+            return 0;
+        }
+        return static_cast<uint8_t>(data[pos++]);
+    }
+    uint16_t u16() {
+        const uint16_t lo = u8();
+        return static_cast<uint16_t>(lo | (u8() << 8));
+    }
+    uint32_t u32() {
+        const uint32_t lo = u16();
+        return lo | (static_cast<uint32_t>(u16()) << 16);
+    }
+    float f32() {
+        const uint32_t bits = u32();
+        float value;
+        memcpy(&value, &bits, sizeof(value));
+        return value;
+    }
+};
+
+uint32_t floatBits(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+std::string hexBytes(const uint8_t* bytes, size_t count) {
+    std::string out;
+    char pair[3];
+    for (size_t i = 0; i < count; i++) {
+        snprintf(pair, sizeof(pair), "%02x", bytes[i]);
+        out += pair;
+    }
+    return out;
+}
+
+bool isMapConstant(uint16_t key) {
+    return key == static_cast<uint16_t>(CodeConstantKey::NEW_GAME_MAP) ||
+           key == static_cast<uint16_t>(CodeConstantKey::START_LEVEL_1) ||
+           key == static_cast<uint16_t>(CodeConstantKey::START_LEVEL_2);
+}
+
+bool isLevelConstant(uint16_t key) {
+    return key == static_cast<uint16_t>(CodeConstantKey::SPECIAL_LEVEL) ||
+           key == static_cast<uint16_t>(CodeConstantKey::HIDE_JIGGIES_LEVEL) ||
+           key == static_cast<uint16_t>(CodeConstantKey::HIDE_COLLECTIBLES_LEVEL);
+}
+
+bool isWarpConstant(uint16_t key) {
+    return key == static_cast<uint16_t>(CodeConstantKey::WARP_EXIT_BANJOS_HOUSE) ||
+           key == static_cast<uint16_t>(CodeConstantKey::WARP_ENTER_LAIR);
+}
+
+std::string mapComment(uint32_t map) {
+    const char* name = MapName(map);
+    return name ? name : "unknown map";
+}
+
+void emitDest(YAML::Emitter& out, uint16_t dest) {
+    out << YAML::Flow << YAML::BeginMap;
+    out << YAML::Key << "Map" << YAML::Value << YAML_HEX(dest >> 8);
+    out << YAML::Key << "Entrance" << YAML::Value << (dest & 0xFF);
+    out << YAML::EndMap << YAML::Comment(mapComment(dest >> 8));
+}
+
+// Hex for an id, but a negative one would come out as 32-bit hex.
+void emitId(YAML::Emitter& out, int16_t id) {
+    if (id < 0) {
+        out << id;
+    } else {
+        out << YAML_HEX(id);
+    }
+}
+
+// Romhacks store 0xFFFF in some map fields, so a number goes through as it is.
+uint16_t mapNumber(const YAML::Node& node, const std::string& where, uint32_t most = 0xFFFF) {
+    if (const auto named = MapFromName(node.as<std::string>())) {
+        return *named;
+    }
+    return static_cast<uint16_t>(YamlNumber(node, where, most));
+}
+
+uint16_t levelNumber(const YAML::Node& node, const std::string& where) {
+    const std::string text = node.as<std::string>();
+    if (const auto named = LevelFromName(text)) {
+        return *named;
+    }
+    return static_cast<uint16_t>(YamlNumber(node, where, 0xFF));
+}
+
+uint16_t destNumber(const YAML::Node& node, const std::string& where) {
+    if (!node.IsMap() || !node["Map"] || !node["Entrance"]) {
+        YamlFail(where, "needs a Map and an Entrance");
+    }
+    return static_cast<uint16_t>(mapNumber(node["Map"], where + " Map", 0xFF) << 8 |
+                                 YamlNumber(node, "Entrance", where, 0xFF));
+}
+
+void readHex(const YAML::Node& node, const std::string& where, uint8_t* out, size_t count) {
+    const std::string text = node.as<std::string>();
+    if (text.size() != count * 2) {
+        YamlFail(where, "needs " + std::to_string(count * 2) + " hex digits");
+    }
+    for (size_t i = 0; i < count; i++) {
+        out[i] = static_cast<uint8_t>(std::stoul(text.substr(i * 2, 2), nullptr, 16));
+    }
+}
+} // namespace
+
+bool ReadGameConfig(const std::vector<char>& blob, GameConfigData& out, std::string& error) {
+    out = GameConfigData{};
+    BlobReader r{ blob };
+    if (r.u32() != GAMECONFIG_MAGIC) {
+        error = "not a BKCF game config";
+        return false;
+    }
+    if (r.u16() != GAMECONFIG_VERSION) {
+        error = "unknown game config version";
+        return false;
+    }
+    const uint16_t sections = r.u16();
+    const uint8_t nameLength = r.u8();
+    for (uint8_t i = 0; i < nameLength; i++) {
+        out.romName += static_cast<char>(r.u8());
+    }
+    for (uint16_t section = 0; section < sections && r.ok; section++) {
+        const uint16_t type = r.u16();
+        const uint16_t count = r.u16();
+        for (uint16_t entry = 0; entry < count && r.ok; entry++) {
+            switch (static_cast<ConfigSectionType>(type)) {
+                case ConfigSectionType::CODE_CONSTANTS:
+                    out.constants.push_back({ r.u16(), r.u16() });
+                    break;
+                case ConfigSectionType::SCENE_REMAP:
+                    out.worldByMap.push_back({ r.u16(), r.u16() });
+                    break;
+                case ConfigSectionType::RETURN_TO_LAIR: {
+                    const uint8_t world = r.u8();
+                    r.u8();
+                    out.returnToLair.push_back({ world, r.u16(), r.u16() });
+                    break;
+                }
+                case ConfigSectionType::MUSIC:
+                    out.music.push_back({ r.u16(), r.u16(), r.u16() });
+                    break;
+                case ConfigSectionType::SKYBOX: {
+                    GameConfigData::Sky sky{ r.u16() };
+                    for (auto& layer : sky.layers) {
+                        layer.model = static_cast<int16_t>(r.u16());
+                        layer.scale = r.f32();
+                        layer.spin = r.f32();
+                    }
+                    out.skybox.push_back(sky);
+                    break;
+                }
+                case ConfigSectionType::SCENE_DEF: {
+                    GameConfigData::LevelModels models{ r.u16() };
+                    models.opaque = static_cast<int16_t>(r.u16());
+                    models.translucent = static_cast<int16_t>(r.u16());
+                    for (int16_t& v : models.cubeMin) {
+                        v = static_cast<int16_t>(r.u16());
+                    }
+                    for (int16_t& v : models.cubeMax) {
+                        v = static_cast<int16_t>(r.u16());
+                    }
+                    models.scale = r.f32();
+                    out.levelModels.push_back(models);
+                    break;
+                }
+                case ConfigSectionType::LEVEL_NAMES: {
+                    GameConfigData::Title title{ r.u8() };
+                    const uint8_t length = r.u8();
+                    for (uint8_t i = 0; i < length; i++) {
+                        title.text += static_cast<char>(r.u8());
+                    }
+                    out.titles.push_back(title);
+                    break;
+                }
+                case ConfigSectionType::WARP_DESTINATIONS:
+                    out.warps.push_back({ r.u16(), r.u16() });
+                    break;
+                case ConfigSectionType::NOTE_DOORS: {
+                    const uint8_t door = r.u8();
+                    r.u8();
+                    out.noteDoors.push_back({ door, r.u16() });
+                    break;
+                }
+                case ConfigSectionType::JIGGY_PUZZLES: {
+                    GameConfigData::Puzzle puzzle{ r.u8(), r.u8(), r.u8() };
+                    r.u8();
+                    puzzle.flag = r.u16();
+                    out.puzzles.push_back(puzzle);
+                    break;
+                }
+                case ConfigSectionType::CUSTOM_CODE:
+                    out.hasCustomCode = true;
+                    out.customCodeRamBase = r.u32();
+                    for (uint8_t& b : out.customCodeSha1) {
+                        b = r.u8();
+                    }
+                    break;
+                case ConfigSectionType::CUSTOM_CODE_INFO:
+                    out.customCodeKind = static_cast<CustomCodeKind>(r.u16());
+                    r.u16();
+                    break;
+                case ConfigSectionType::ROM_HASH:
+                    out.hasRomHash = true;
+                    for (uint8_t& b : out.romHash) {
+                        b = r.u8();
+                    }
+                    break;
+                default:
+                    error = "unknown game config section " + std::to_string(type);
+                    return false;
+            }
+        }
+    }
+    if (!r.ok) {
+        error = "game config ends early";
+        return false;
+    }
+    return true;
+}
+
+// Sections go out in the order BuildGameConfigBlob writes them.
+std::vector<char> WriteGameConfig(const GameConfigData& config) {
+    BlobWriter blob;
+    uint16_t sectionCount = 0;
+    blob.writeU32(GAMECONFIG_MAGIC);
+    blob.writeU16(GAMECONFIG_VERSION);
+    const size_t sectionCountPos = blob.data.size();
+    blob.writeU16(0);
+    const uint8_t nameLength = static_cast<uint8_t>(std::min(config.romName.size(), size_t(255)));
+    blob.writeU8(nameLength);
+    for (uint8_t i = 0; i < nameLength; i++) {
+        blob.writeU8(static_cast<uint8_t>(config.romName[i]));
+    }
+
+    const auto section = [&](ConfigSectionType type, size_t count, const auto& writeEntry) {
+        if (count == 0) {
+            return;
+        }
+        const size_t pos = blob.beginSection(type);
+        for (size_t i = 0; i < count; i++) {
+            writeEntry(i);
+        }
+        blob.patchU16(pos, static_cast<uint16_t>(count));
+        sectionCount++;
+    };
+
+    section(ConfigSectionType::CUSTOM_CODE, config.hasCustomCode, [&](size_t) {
+        blob.writeU32(config.customCodeRamBase);
+        for (uint8_t b : config.customCodeSha1) {
+            blob.writeU8(b);
+        }
+    });
+    section(ConfigSectionType::CUSTOM_CODE_INFO, config.hasCustomCode, [&](size_t) {
+        blob.writeU16(static_cast<uint16_t>(config.customCodeKind));
+        blob.writeU16(0);
+    });
+    section(ConfigSectionType::ROM_HASH, config.hasRomHash, [&](size_t) {
+        for (uint8_t b : config.romHash) {
+            blob.writeU8(b);
+        }
+    });
+    section(ConfigSectionType::CODE_CONSTANTS, config.constants.size(), [&](size_t i) {
+        blob.writeU16(config.constants[i].key);
+        blob.writeU16(config.constants[i].value);
+    });
+    section(ConfigSectionType::SCENE_REMAP, config.worldByMap.size(), [&](size_t i) {
+        blob.writeU16(config.worldByMap[i].map);
+        blob.writeU16(config.worldByMap[i].level);
+    });
+    section(ConfigSectionType::RETURN_TO_LAIR, config.returnToLair.size(), [&](size_t i) {
+        blob.writeU8(config.returnToLair[i].world);
+        blob.writeU8(0);
+        blob.writeU16(config.returnToLair[i].map);
+        blob.writeU16(config.returnToLair[i].exit);
+    });
+    section(ConfigSectionType::MUSIC, config.music.size(), [&](size_t i) {
+        blob.writeU16(config.music[i].map);
+        blob.writeU16(config.music[i].track);
+        blob.writeU16(config.music[i].alternate);
+    });
+    section(ConfigSectionType::SKYBOX, config.skybox.size(), [&](size_t i) {
+        blob.writeU16(config.skybox[i].map);
+        for (const auto& layer : config.skybox[i].layers) {
+            blob.writeS16(layer.model);
+            blob.writeU32(floatBits(layer.scale));
+            blob.writeU32(floatBits(layer.spin));
+        }
+    });
+    section(ConfigSectionType::SCENE_DEF, config.levelModels.size(), [&](size_t i) {
+        const auto& models = config.levelModels[i];
+        blob.writeU16(models.map);
+        blob.writeS16(models.opaque);
+        blob.writeS16(models.translucent);
+        for (int16_t v : models.cubeMin) {
+            blob.writeS16(v);
+        }
+        for (int16_t v : models.cubeMax) {
+            blob.writeS16(v);
+        }
+        blob.writeU32(floatBits(models.scale));
+    });
+    section(ConfigSectionType::LEVEL_NAMES, config.titles.size(), [&](size_t i) {
+        const auto& title = config.titles[i];
+        const uint8_t length = static_cast<uint8_t>(std::min(title.text.size(), size_t(255)));
+        blob.writeU8(title.index);
+        blob.writeU8(length);
+        for (uint8_t c = 0; c < length; c++) {
+            blob.writeU8(static_cast<uint8_t>(title.text[c]));
+        }
+    });
+    section(ConfigSectionType::WARP_DESTINATIONS, config.warps.size(), [&](size_t i) {
+        blob.writeU16(config.warps[i].warp);
+        blob.writeU16(config.warps[i].dest);
+    });
+    section(ConfigSectionType::NOTE_DOORS, config.noteDoors.size(), [&](size_t i) {
+        blob.writeU8(config.noteDoors[i].door);
+        blob.writeU8(0);
+        blob.writeU16(config.noteDoors[i].notes);
+    });
+    section(ConfigSectionType::JIGGY_PUZZLES, config.puzzles.size(), [&](size_t i) {
+        const auto& puzzle = config.puzzles[i];
+        blob.writeU8(puzzle.picture);
+        blob.writeU8(puzzle.cost);
+        blob.writeU8(puzzle.size);
+        blob.writeU8(0);
+        blob.writeU16(puzzle.flag);
+    });
+
+    blob.patchU16(sectionCountPos, sectionCount);
+    return blob.data;
+}
+
+std::string GameConfigToYaml(const GameConfigData& config) {
+    YAML::Emitter out;
+    out.SetIndent(2);
+    out << YAML::BeginMap << YAML::Key << "aGameConfig" << YAML::Value << YAML::BeginMap;
+    if (!config.romName.empty()) {
+        out << YAML::Key << "RomName" << YAML::Value;
+        EmitText(out, config.romName);
+    }
+
+    if (!config.constants.empty()) {
+        out << YAML::Key << "Constants" << YAML::Value << YAML::BeginMap;
+        for (const auto& constant : config.constants) {
+            const char* name = CodeConstantName(constant.key);
+            out << YAML::Key << (name ? std::string(name) : std::to_string(constant.key)) << YAML::Value;
+            if (isMapConstant(constant.key)) {
+                out << YAML_HEX(constant.value) << YAML::Comment(mapComment(constant.value));
+            } else if (isLevelConstant(constant.key)) {
+                const char* level = LevelName(constant.value);
+                out << YAML_HEX(constant.value) << YAML::Comment(level ? level : "unknown world");
+            } else if (isWarpConstant(constant.key)) {
+                emitDest(out, constant.value);
+            } else if (constant.key == static_cast<uint16_t>(CodeConstantKey::KNOW_ALL_MOVES) &&
+                       constant.value == KNOW_ALL_MOVES_ON) {
+                out << true;
+            } else {
+                out << constant.value;
+            }
+        }
+        out << YAML::EndMap;
+    }
+    if (!config.worldByMap.empty()) {
+        out << YAML::Key << "WorldByMap" << YAML::Value << YAML::BeginMap;
+        for (const auto& entry : config.worldByMap) {
+            const char* level = LevelName(entry.level);
+            out << YAML::Key << YAML_HEX(entry.map) << YAML::Value << YAML_HEX(entry.level)
+                << YAML::Comment(mapComment(entry.map) + " -> " + (level ? level : "unknown world"));
+        }
+        out << YAML::EndMap;
+    }
+    if (!config.returnToLair.empty()) {
+        out << YAML::Key << "ReturnToLair" << YAML::Value << YAML::BeginMap;
+        for (const auto& entry : config.returnToLair) {
+            out << YAML::Key << static_cast<uint32_t>(entry.world) << YAML::Value << YAML::Flow << YAML::BeginMap;
+            out << YAML::Key << "Map" << YAML::Value << YAML_HEX(entry.map);
+            out << YAML::Key << "Exit" << YAML::Value << YAML_HEX(entry.exit);
+            out << YAML::EndMap << YAML::Comment(mapComment(entry.map));
+        }
+        out << YAML::EndMap;
+    }
+    if (!config.music.empty()) {
+        out << YAML::Key << "MusicByMap" << YAML::Value << YAML::BeginMap;
+        for (const auto& entry : config.music) {
+            out << YAML::Key << YAML_HEX(entry.map) << YAML::Value << YAML::Flow << YAML::BeginMap;
+            out << YAML::Key << "Track" << YAML::Value << YAML_HEX(entry.track);
+            out << YAML::Key << "Alternate" << YAML::Value << YAML_HEX(entry.alternate);
+            out << YAML::EndMap << YAML::Comment(mapComment(entry.map));
+        }
+        out << YAML::EndMap;
+    }
+    if (!config.skybox.empty()) {
+        out << YAML::Key << "SkyboxByMap" << YAML::Value << YAML::BeginMap;
+        for (const auto& sky : config.skybox) {
+            out << YAML::Key << YAML_HEX(sky.map) << YAML::Comment(mapComment(sky.map));
+            out << YAML::Value << YAML::BeginSeq;
+            for (const auto& layer : sky.layers) {
+                out << YAML::Flow << YAML::BeginMap;
+                out << YAML::Key << "Model" << YAML::Value;
+                emitId(out, layer.model);
+                out << YAML::Key << "Scale" << YAML::Value << layer.scale;
+                out << YAML::Key << "Spin" << YAML::Value << layer.spin;
+                out << YAML::EndMap;
+            }
+            out << YAML::EndSeq;
+        }
+        out << YAML::EndMap;
+    }
+    if (!config.levelModels.empty()) {
+        out << YAML::Key << "LevelModelsByMap" << YAML::Value << YAML::BeginMap;
+        for (const auto& models : config.levelModels) {
+            out << YAML::Key << YAML_HEX(models.map) << YAML::Value << YAML::Flow << YAML::BeginMap;
+            out << YAML::Key << "Opaque" << YAML::Value;
+            emitId(out, models.opaque);
+            out << YAML::Key << "Translucent" << YAML::Value;
+            emitId(out, models.translucent);
+            EmitList(out, "CubeMin", models.cubeMin, 3);
+            EmitList(out, "CubeMax", models.cubeMax, 3);
+            out << YAML::Key << "Scale" << YAML::Value << models.scale;
+            out << YAML::EndMap << YAML::Comment(mapComment(models.map));
+        }
+        out << YAML::EndMap;
+    }
+    if (!config.titles.empty()) {
+        out << YAML::Key << "PauseMenuTitles" << YAML::Value << YAML::BeginMap;
+        for (const auto& title : config.titles) {
+            out << YAML::Key << static_cast<uint32_t>(title.index) << YAML::Value;
+            EmitText(out, title.text);
+            if (title.index < TITLE_COUNT) {
+                out << YAML::Comment(std::string("was ") + sVanillaLevelNames[title.index]);
+            }
+        }
+        out << YAML::EndMap;
+    }
+    if (!config.warps.empty()) {
+        out << YAML::Key << "Warps" << YAML::Value << YAML::BeginMap;
+        for (const auto& warp : config.warps) {
+            out << YAML::Key << YAML_HEX(warp.warp) << YAML::Value;
+            emitDest(out, warp.dest);
+        }
+        out << YAML::EndMap;
+    }
+    if (!config.noteDoors.empty()) {
+        out << YAML::Key << "NoteDoors" << YAML::Value << YAML::BeginMap;
+        for (const auto& door : config.noteDoors) {
+            out << YAML::Key << static_cast<uint32_t>(door.door) << YAML::Value << door.notes;
+            if (door.door < NOTE_DOOR_COUNT) {
+                out << YAML::Comment("door " + std::to_string(door.door + 1) + ", was " +
+                                     std::to_string(sVanillaNoteDoors[door.door]));
+            }
+        }
+        out << YAML::EndMap;
+    }
+    if (!config.puzzles.empty()) {
+        out << YAML::Key << "JiggyPuzzles" << YAML::Value << YAML::BeginMap;
+        for (const auto& puzzle : config.puzzles) {
+            out << YAML::Key << static_cast<uint32_t>(puzzle.picture) << YAML::Value << YAML::Flow << YAML::BeginMap;
+            out << YAML::Key << "Cost" << YAML::Value << static_cast<uint32_t>(puzzle.cost);
+            out << YAML::Key << "Size" << YAML::Value << static_cast<uint32_t>(puzzle.size);
+            out << YAML::Key << "Flag" << YAML::Value << YAML_HEX(puzzle.flag);
+            out << YAML::EndMap;
+        }
+        out << YAML::EndMap;
+    }
+    if (config.hasCustomCode) {
+        out << YAML::Key << "CustomCode" << YAML::Value << YAML::Flow << YAML::BeginMap;
+        out << YAML::Key << "RamBase" << YAML::Value << YAML_HEX(config.customCodeRamBase);
+        out << YAML::Key << "Sha1" << YAML::Value << hexBytes(config.customCodeSha1, 20);
+        out << YAML::Key << "Kind" << YAML::Value << static_cast<uint32_t>(config.customCodeKind);
+        out << YAML::EndMap;
+    }
+    if (config.hasRomHash) {
+        out << YAML::Key << "RomHash" << YAML::Value << hexBytes(config.romHash, 20);
+    }
+    out << YAML::EndMap << YAML::EndMap;
+    return std::string(out.c_str()) + "\n";
+}
+
+bool GameConfigFromYaml(const std::string& text, GameConfigData& out, std::string& error) {
+    out = GameConfigData{};
+    try {
+        const YAML::Node root = YAML::Load(text);
+        const YAML::Node config = root["aGameConfig"];
+        if (!config || !config.IsMap()) {
+            error = "no aGameConfig map";
+            return false;
+        }
+        if (config["RomName"]) {
+            out.romName = DecodeText(config["RomName"].as<std::string>());
+            if (out.romName.size() > 255) {
+                YamlFail("RomName", "longer than 255 characters");
+            }
+        }
+        for (const auto& entry : config["Constants"]) {
+            const std::string name = entry.first.as<std::string>();
+            uint16_t key = 0;
+            while (key < static_cast<uint16_t>(CodeConstantKey::COUNT) && name != sCodeConstantNames[key]) {
+                key++;
+            }
+            if (key == static_cast<uint16_t>(CodeConstantKey::COUNT)) {
+                YamlFail("Constants", name + " isn't a setting");
+            }
+            const std::string where = "Constants " + name;
+            uint16_t value;
+            if (isMapConstant(key)) {
+                value = mapNumber(entry.second, where);
+            } else if (isLevelConstant(key)) {
+                value = levelNumber(entry.second, where);
+            } else if (isWarpConstant(key)) {
+                value = destNumber(entry.second, where);
+            } else if (bool on; key == static_cast<uint16_t>(CodeConstantKey::KNOW_ALL_MOVES) &&
+                                YAML::convert<bool>::decode(entry.second, on)) {
+                if (!on) {
+                    continue;
+                }
+                value = KNOW_ALL_MOVES_ON;
+            } else {
+                value = static_cast<uint16_t>(YamlNumber(entry.second, where, 0xFFFF));
+            }
+            out.constants.push_back({ key, value });
+        }
+        for (const auto& entry : config["WorldByMap"]) {
+            out.worldByMap.push_back({ mapNumber(entry.first, "WorldByMap"), levelNumber(entry.second, "WorldByMap") });
+        }
+        for (const auto& entry : config["ReturnToLair"]) {
+            const std::string where = "ReturnToLair " + entry.first.as<std::string>();
+            out.returnToLair.push_back({ static_cast<uint8_t>(YamlNumber(entry.first, where, 0xFF)),
+                                         mapNumber(entry.second["Map"], where + " Map"),
+                                         static_cast<uint16_t>(YamlNumber(entry.second, "Exit", where, 0xFFFF)) });
+        }
+        for (const auto& entry : config["MusicByMap"]) {
+            const std::string where = "MusicByMap " + entry.first.as<std::string>();
+            out.music.push_back({ mapNumber(entry.first, where),
+                                  static_cast<uint16_t>(YamlNumber(entry.second, "Track", where, 0xFFFF)),
+                                  static_cast<uint16_t>(YamlNumber(entry.second, "Alternate", where, 0xFFFF)) });
+        }
+        for (const auto& entry : config["SkyboxByMap"]) {
+            const std::string where = "SkyboxByMap " + entry.first.as<std::string>();
+            GameConfigData::Sky sky{ mapNumber(entry.first, where) };
+            if (!entry.second.IsSequence() || entry.second.size() != 3) {
+                YamlFail(where, "needs three layers");
+            }
+            for (size_t i = 0; i < 3; i++) {
+                const YAML::Node layer = entry.second[i];
+                sky.layers[i] = { YamlShort(layer, "Model", where), layer["Scale"].as<float>(),
+                                  layer["Spin"].as<float>() };
+            }
+            out.skybox.push_back(sky);
+        }
+        for (const auto& entry : config["LevelModelsByMap"]) {
+            const std::string where = "LevelModelsByMap " + entry.first.as<std::string>();
+            GameConfigData::LevelModels models{ mapNumber(entry.first, where) };
+            models.opaque = YamlShort(entry.second, "Opaque", where);
+            models.translucent = YamlShort(entry.second, "Translucent", where);
+            ReadList(entry.second, "CubeMin", models.cubeMin, 3, where);
+            ReadList(entry.second, "CubeMax", models.cubeMax, 3, where);
+            models.scale = entry.second["Scale"].as<float>();
+            out.levelModels.push_back(models);
+        }
+        for (const auto& entry : config["PauseMenuTitles"]) {
+            const std::string where = "PauseMenuTitles " + entry.first.as<std::string>();
+            GameConfigData::Title title{ static_cast<uint8_t>(YamlNumber(entry.first, where, TITLE_COUNT - 1)),
+                                         DecodeText(entry.second.as<std::string>()) };
+            if (title.text.size() > 255) {
+                YamlFail(where, "longer than 255 characters");
+            }
+            out.titles.push_back(title);
+        }
+        for (const auto& entry : config["Warps"]) {
+            const std::string where = "Warps " + entry.first.as<std::string>();
+            out.warps.push_back({ static_cast<uint16_t>(YamlNumber(entry.first, where, WARP_ENTRY_COUNT - 1)),
+                                  destNumber(entry.second, where) });
+        }
+        for (const auto& entry : config["NoteDoors"]) {
+            const std::string where = "NoteDoors " + entry.first.as<std::string>();
+            out.noteDoors.push_back({ static_cast<uint8_t>(YamlNumber(entry.first, where, NOTE_DOOR_COUNT - 1)),
+                                      static_cast<uint16_t>(YamlNumber(entry.second, where, 0xFFFF)) });
+        }
+        for (const auto& entry : config["JiggyPuzzles"]) {
+            const std::string where = "JiggyPuzzles " + entry.first.as<std::string>();
+            GameConfigData::Puzzle puzzle{ static_cast<uint8_t>(YamlNumber(entry.first, where, PUZZLE_COUNT - 1)),
+                                           static_cast<uint8_t>(YamlNumber(entry.second, "Cost", where, 0xFF)),
+                                           static_cast<uint8_t>(YamlNumber(entry.second, "Size", where, 0xFF)),
+                                           static_cast<uint16_t>(YamlNumber(entry.second, "Flag", where, 0xFFFF)) };
+            if (puzzle.picture < PUZZLE_MASK_PICTURES && puzzle.cost > PUZZLE_MASK_PIECES) {
+                SPDLOG_WARN("[aGameConfig] {}: a picture needing more than {} jiggies can't be finished", where,
+                            PUZZLE_MASK_PIECES);
+            }
+            out.puzzles.push_back(puzzle);
+        }
+        if (const YAML::Node code = config["CustomCode"]) {
+            out.hasCustomCode = true;
+            out.customCodeRamBase = YamlNumber(code, "RamBase", "CustomCode", 0xFFFFFFFF);
+            readHex(code["Sha1"], "CustomCode Sha1", out.customCodeSha1, 20);
+            out.customCodeKind = static_cast<CustomCodeKind>(YamlNumber(code, "Kind", "CustomCode", 0xFFFF));
+        }
+        if (const YAML::Node hash = config["RomHash"]) {
+            out.hasRomHash = true;
+            readHex(hash, "RomHash", out.romHash, 20);
+        }
+    } catch (const std::exception& e) {
+        error = e.what();
+        return false;
+    }
+    return true;
+}
+
+void EmitAssetHashes(const std::filesystem::path& romPath, const std::filesystem::path& outputPath) {
+    std::ifstream input(romPath, std::ios::binary);
+    if (!input) {
+        SPDLOG_ERROR("Failed to open ROM at {}", romPath.string());
+        return;
+    }
+    std::vector<uint8_t> rom((std::istreambuf_iterator<char>(input)), {});
+    input.close();
+
+    std::ofstream out(outputPath);
+    if (!out) {
+        SPDLOG_ERROR("Failed to open output {}", outputPath.string());
+        return;
+    }
+    out << "# Auto-generated by `torch hashes`. Per-slot SHA-1 of the compressed\n"
+        << "# byte range that the BK64 asset table at 0x5E90 points to. Used by\n"
+        << "# Torch to skip factory dispatch for unmodified slots when extracting\n"
+        << "# BB-style romhacks. DO NOT hand-edit.\n"
+        << "hashes:\n";
+
+    size_t hashed = 0;
+    const size_t total = WalkAssetTable(rom, [&](uint32_t i, const std::string& sha1) {
+        out << "  0x" << std::hex << std::uppercase << i << std::dec << ": " << sha1 << "\n";
+        hashed++;
+    });
+
+    // Vanilla warp destinations, consumed by the WARP_DESTINATIONS emitter when a
+    // hack relocates F9CAE0 and no in-ROM vanilla table is left to diff against.
+    uint32_t f9Size = 0;
+    uint8_t* f9 = TryUnzipAt(rom, VANILLA_F9CAE0, &f9Size);
+    uint32_t ovlSize = 0;
+    uint8_t* ovl = TryUnzipAt(rom, VANILLA_F37F90_OFFSET, &ovlSize);
+
+    size_t warpCount = 0;
+    if (f9 && ovl && f9Size > WARP_TABLE_OFF + WARP_ENTRY_COUNT * 4) {
+        out << "\n# Vanilla warp destinations (MAP<<8 | ENTRY) by warp-table index, scanned\n"
+            << "# from the F9CAE0 table at 0xC3F0. Warp functions with no single scannable\n"
+            << "# destination are omitted.\n"
+            << "warps:\n";
+
+        const std::vector<uint32_t> funcOffs = CollectWarpFuncOffsets(f9);
+
+        for (int w = 0; w < WARP_ENTRY_COUNT; w++) {
+            uint32_t addr = ReadU32BE(f9 + WARP_TABLE_OFF + w * 4);
+            if (addr < N64_OVL_BASE) {
+                continue;
+            }
+            uint32_t funcOff = addr - N64_OVL_BASE;
+            auto next = std::upper_bound(funcOffs.begin(), funcOffs.end(), funcOff);
+            uint32_t funcLen = (next != funcOffs.end()) ? (*next - funcOff) : 200;
+            int dest = -1;
+            if (ScanWarpDestOnly(ovl, funcOff, funcLen, ovlSize, dest)) {
+                out << "  " << w << ": 0x" << std::hex << std::uppercase << dest << std::dec << "\n";
+                warpCount++;
+            }
+        }
+    }
+    if (f9) {
+        free(f9);
+    }
+    if (ovl) {
+        free(ovl);
+    }
+    out.close();
+
+    SPDLOG_INFO("Hashed {} of {} slots ({} empty/zero-sized), {} vanilla warps -> {}", hashed, total, total - hashed,
+                warpCount, outputPath.string());
+}
+
+size_t CountModifiedSlots(const std::vector<uint8_t>& rom, const std::filesystem::path& hashesYamlPath) {
+    if (!fs::exists(hashesYamlPath)) {
+        SPDLOG_WARN("hashes.yaml not found at {}; cannot count modified slots", hashesYamlPath.string());
+        return 0;
+    }
+    std::unordered_map<uint32_t, std::string> baseline;
+    try {
+        YAML::Node root = YAML::LoadFile(hashesYamlPath.string());
+        YAML::Node hashes = root["hashes"];
+        if (hashes && hashes.IsMap()) {
+            for (auto it = hashes.begin(); it != hashes.end(); ++it) {
+                baseline[it->first.as<uint32_t>()] = it->second.as<std::string>();
+            }
+        }
+    } catch (const std::exception& e) {
+        SPDLOG_WARN("Failed to parse hashes.yaml: {}", e.what());
+        return 0;
+    }
+
+    size_t modified = 0;
+    WalkAssetTable(rom, [&](uint32_t i, const std::string& sha1) {
+        auto it = baseline.find(i);
+        if (it == baseline.end() || it->second != sha1) {
+            modified++;
+        }
+    });
+    return modified;
+}
+
+namespace {
+struct BaselineHashCache {
+    std::unordered_map<uint32_t, std::string> entries;
+    bool attempted = false;
+};
+BaselineHashCache& GetBaselineCache() {
+    static BaselineHashCache cache;
+    return cache;
+}
+} // namespace
+
+const std::string& GetBaselineAssetHash(uint32_t assetId) {
+    static const std::string kEmpty;
+
+    auto& cache = GetBaselineCache();
+    if (!cache.attempted) {
+        cache.attempted = true;
+        const auto path = fs::path(Companion::Instance->GetAssetPath()) / "hashes.yaml";
+        if (fs::exists(path)) {
+            try {
+                YAML::Node root = YAML::LoadFile(path.string());
+                YAML::Node hashes = root["hashes"];
+                if (hashes && hashes.IsMap()) {
+                    for (auto it = hashes.begin(); it != hashes.end(); ++it) {
+                        cache.entries[it->first.as<uint32_t>()] = it->second.as<std::string>();
+                    }
+                    SPDLOG_WARN("Loaded {} baseline asset hashes from {}", cache.entries.size(), path.string());
+                }
+            } catch (const std::exception& e) {
+                SPDLOG_WARN("Failed to load baseline hashes at {}: {}", path.string(), e.what());
+            }
+        }
+    }
+
+    auto it = cache.entries.find(assetId);
+    return (it != cache.entries.end()) ? it->second : kEmpty;
+}
+
+namespace {
+struct VanillaWarpCache {
+    std::unordered_map<uint32_t, int> entries;
+    bool attempted = false;
+};
+VanillaWarpCache& GetVanillaWarpCache() {
+    static VanillaWarpCache cache;
+    return cache;
+}
+} // namespace
+
+int GetVanillaWarpDest(uint32_t warpIndex) {
+
+    auto& cache = GetVanillaWarpCache();
+    if (!cache.attempted) {
+        cache.attempted = true;
+        const auto path = fs::path(Companion::Instance->GetAssetPath()) / "hashes.yaml";
+        if (fs::exists(path)) {
+            try {
+                YAML::Node root = YAML::LoadFile(path.string());
+                YAML::Node warps = root["warps"];
+                if (warps && warps.IsMap()) {
+                    for (auto it = warps.begin(); it != warps.end(); ++it) {
+                        cache.entries[it->first.as<uint32_t>()] = it->second.as<int>();
+                    }
+                    SPDLOG_INFO("Loaded {} vanilla warp destinations from {}", cache.entries.size(), path.string());
+                }
+            } catch (const std::exception& e) {
+                SPDLOG_WARN("Failed to load vanilla warps at {}: {}", path.string(), e.what());
+            }
+        }
+    }
+
+    auto it = cache.entries.find(warpIndex);
+    return (it != cache.entries.end()) ? it->second : -1;
+}
+
+bool TrySynthesizeRomConfig(YAML::Node& config, const std::string& cartHash, const std::filesystem::path& romPath,
+                            const std::vector<uint8_t>& rom) {
+    if (config[cartHash]) {
+        return false;
+    }
+
+    // Classification confirms the ROM actually carries a BK boot overlay. An extended
+    // ROM that isn't BK-derived won't match the boot pattern, so we bail instead of
+    // running a BK64 extraction that was never going to work.
+    const RomhackKind kind = ClassifyRomhack(rom);
+    if (kind == RomhackKind::NotRomhack) {
+        return false;
+    }
+    if (kind == RomhackKind::UnknownRom) {
+        SPDLOG_WARN("[ConfigFactory] {} is >16MB but doesn't look like a BK romhack. Aborting extraction.", cartHash);
+        return false;
+    }
+
+    const char* buildType = kind == RomhackKind::BBRomhack ? "Banjo's Backpack" : "custom";
+
+    std::string stem = romPath.stem().string();
+    std::string slug;
+    slug.reserve(stem.size());
+    bool lastWasDash = true; // suppress leading dash
+    for (char c : stem) {
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+            slug += c;
+            lastWasDash = false;
+        } else if (c >= 'A' && c <= 'Z') {
+            slug += static_cast<char>(c - 'A' + 'a');
+            lastWasDash = false;
+        } else if (!lastWasDash) {
+            slug += '-';
+            lastWasDash = true;
+        }
+    }
+    while (!slug.empty() && slug.back() == '-')
+        slug.pop_back();
+    if (slug.empty())
+        slug = cartHash.substr(0, 8);
+
+    YAML::Node entry;
+    entry["name"] = std::string(kind == RomhackKind::BBRomhack ? "BB Romhack" : "Custom BK Romhack") +
+                    " (auto-detected: " + stem + ")";
+    entry["path"] = "assets/yaml/us/rev0";
+    YAML::Node entryCfg;
+    entryCfg["gbi"] = "F3DEX_BK64";
+    entryCfg["sort"] = "OFFSET";
+    entryCfg["logging"] = "WARN";
+    entryCfg["textures"] = "ADDITIONAL_DEFINES";
+    entryCfg["include_autogen"] = true;
+    YAML::Node entryOut;
+    entryOut["binary"] = "mods/~romhacks/" + slug + ".o2r";
+    entryOut["code"] = "src/assets";
+    entryOut["headers"] = "include/assets";
+    entryOut["modding"] = "src/assets";
+    entryCfg["output"] = entryOut;
+    entry["config"] = entryCfg;
+    config[cartHash] = entry;
+
+    SPDLOG_WARN("[ConfigFactory] Auto-detected BK romhack {} (build: {}); routing to mods/~romhacks/{}.o2r", cartHash,
+                buildType, slug);
+    return true;
+}
+
+} // namespace BK64

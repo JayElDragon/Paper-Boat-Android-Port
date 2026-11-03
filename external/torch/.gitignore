@@ -1,0 +1,24 @@
+.idea/
+build-*/
+cmake-build-*/
+*.otr
+*.log
+.DS_Store
+debug/
+!src/factories/debug/
+*.z64
+*.n64
+*.inc.c
+headers/
+build/
+code/
+.vscode/
+tools/
+modding/*
+.cache
+
+# Doxygen output
+docs/html
+docs/latex
+# Vendored here: StormLib's own headers are sources, not build output
+!lib/StormLib/src/libtomcrypt/src/headers/

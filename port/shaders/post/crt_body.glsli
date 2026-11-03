@@ -1,0 +1,142 @@
+@prism(type='fragment', name='CRT Body', version='3.0.0', description='Beam-accurate CRT simulation with @setting tweakables', author='@Lywx')
+
+    @setting(var='CURVATURE', name='Curvature', default=0.08, min=0.0, max=0.25)
+    @setting(var='VIGNETTE', name='Vignette', default=0.22, min=0.0, max=0.6)
+    const float kCurvature  = @{CURVATURE};
+    const float kVignette   = @{VIGNETTE};
+    const float kEdgeSoft   = 1.5;
+
+    @setting(var='HARD_SCAN', name='Beam focus (vertical)', default=-8.0, min=-16.0, max=-4.0)
+    @setting(var='HARD_PIX', name='Beam sharpness (horizontal)', default=-3.0, min=-6.0, max=-1.0)
+    const float kLines      = 240.0;
+    const float kCols       = 320.0;
+    const float kHardScan   = @{HARD_SCAN};
+    const float kHardPix    = @{HARD_PIX};
+
+    @setting(var='MASK_TYPE', name='Mask type', type='enum', options='Aperture grille:0|Shadow mask:1|Slot mask:2', default=1)
+    @setting(var='MASK_PITCH', name='Phosphor dot size (px)', type='int', default=2, min=1, max=6)
+    @setting(var='MASK_DARK', name='Mask dark level', default=0.55, min=0.0, max=1.0)
+    @setting(var='MASK_LIGHT', name='Mask light level', default=1.45, min=1.0, max=2.0)
+    @setting(var='TINT', name='Phosphor tint', type='color', default='1.0, 1.0, 1.0')
+    const float kMaskPitch  = float(@{MASK_PITCH});
+    const float kMaskDark   = @{MASK_DARK};
+    const float kMaskLight  = @{MASK_LIGHT};
+    const vec3 kTint        = vec3(@{TINT});
+
+    @setting(var='BRIGHTNESS', name='Brightness boost', default=1.25, min=0.5, max=2.0)
+    @setting(var='FLICKER', name='Flicker', default=0.01, min=0.0, max=0.1)
+    const float kGamma      = 2.2;
+    const float kBrightness = @{BRIGHTNESS};
+    const float kFlicker    = @{FLICKER};
+
+    @setting(var='SLOW_BEAM', name='Slow beam demo', type='toggle', default=0)
+    @setting(var='BEAM_SPEED', name='Beam speed (lines/sec)', default=480.0, min=10.0, max=16000.0)
+    @setting(var='PHOSPHOR_DECAY', name='Phosphor decay', default=6.0, min=0.5, max=30.0)
+
+    vec3 CrtToLinear(vec3 c) {
+        return pow(max(c, vec3(0.0)), vec3(kGamma));
+    }
+
+    float CrtGaus(float pos, float scale) {
+        return exp2(scale * pos * pos);
+    }
+
+    vec3 CrtFetch(float col, float line) {
+        if (line < 0.0 || line >= kLines) {
+            return vec3(0.0);
+        }
+        vec2 uv = vec2((col + 0.5) / kCols, (line + 0.5) / kLines);
+        return CrtToLinear(CRT_SAMPLE(uv).rgb);
+    }
+
+@if(SLOW_BEAM)
+    float CrtPersistence(float line) {
+        float beamPos = uCustom[0].y * @{BEAM_SPEED};
+        float age = mod(beamPos - line, kLines) / kLines;
+        return exp(-age * @{PHOSPHOR_DECAY});
+    }
+@end
+
+    vec3 CrtHorz(float baseCol, float dx, float line) {
+        vec3 a = CrtFetch(baseCol - 1.0, line);
+        vec3 b = CrtFetch(baseCol,       line);
+        vec3 c = CrtFetch(baseCol + 1.0, line);
+        float wa = CrtGaus(dx + 1.0, kHardPix);
+        float wb = CrtGaus(dx,       kHardPix);
+        float wc = CrtGaus(dx - 1.0, kHardPix);
+        vec3 row = (a * wa + b * wb + c * wc) / (wa + wb + wc);
+@if(SLOW_BEAM)
+        row *= CrtPersistence(line);
+@end
+        return row;
+    }
+
+    vec3 CrtMask(vec2 fragPx) {
+        vec2 cell = floor(fragPx / kMaskPitch);
+        @if(MASK_TYPE == 1)
+            float x = cell.x + floor(mod(cell.y, 2.0)) * 1.5;
+            x = fract(x / 3.0) * 3.0;
+        @else
+            float x = fract(cell.x / 3.0) * 3.0;
+        @end
+        vec3 mask = vec3(kMaskDark);
+        if (x < 1.0) {
+            mask.r = kMaskLight;
+        } else if (x < 2.0) {
+            mask.g = kMaskLight;
+        } else {
+            mask.b = kMaskLight;
+        }
+        @if(MASK_TYPE == 2)
+            float triad = floor(cell.x / 3.0);
+            if (mod(cell.y + mod(triad, 2.0) * 2.0, 4.0) < 1.0) {
+                mask *= 0.4;
+            }
+        @end
+        return mask;
+    }
+
+    void main() {
+        vec2 res = uCustom[1].xy;
+        vec2 uv = gl_FragCoord.xy * uCustom[1].zw;
+
+        vec2 cc = uv * 2.0 - 1.0;
+        cc *= 1.0 + kCurvature * dot(cc, cc) - kCurvature;
+        vec2 curved = cc * 0.5 + 0.5;
+
+        vec2 edgePx = (vec2(0.5) - abs(curved - vec2(0.5))) * res;
+        float bezel = clamp(min(edgePx.x, edgePx.y) / kEdgeSoft, 0.0, 1.0);
+        if (bezel <= 0.0) {
+            CRT_OUT = vec4(0.0, 0.0, 0.0, 1.0);
+            return;
+        }
+
+        float ly = curved.y * kLines - 0.5;
+        float baseLine = floor(ly + 0.5);
+        float dy = ly - baseLine;
+        float lx = curved.x * kCols - 0.5;
+        float baseCol = floor(lx + 0.5);
+        float dx = lx - baseCol;
+
+        vec3 color = CrtHorz(baseCol, dx, baseLine - 1.0) * CrtGaus(dy + 1.0, kHardScan) +
+                     CrtHorz(baseCol, dx, baseLine)       * CrtGaus(dy,       kHardScan) +
+                     CrtHorz(baseCol, dx, baseLine + 1.0) * CrtGaus(dy - 1.0, kHardScan);
+
+@if(SLOW_BEAM)
+        float beamPos = uCustom[0].y * @{BEAM_SPEED};
+        float beamLine = mod(beamPos, kLines);
+        float beamCol = fract(beamPos) * kCols;
+        vec2 beamPx = vec2((beamCol + 0.5) / kCols, (beamLine + 0.5) / kLines) * res;
+        float beamDist = length(gl_FragCoord.xy - beamPx);
+        color += vec3(1.0) * exp(-beamDist * beamDist * 0.05);
+@end
+
+        color *= CrtMask(gl_FragCoord.xy);
+        color *= kTint;
+        color *= clamp(1.0 - kVignette * dot(cc, cc), 0.0, 1.0);
+        color *= 1.0 + kFlicker * sin(uCustom[0].y * 120.0 * 3.14159265);
+        color *= kBrightness;
+        color *= bezel;
+
+        CRT_OUT = vec4(pow(max(color, vec3(0.0)), vec3(1.0 / kGamma)), 1.0);
+    }

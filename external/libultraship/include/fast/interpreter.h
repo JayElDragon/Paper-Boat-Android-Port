@@ -20,6 +20,7 @@
 #include <unordered_set>
 
 #include "fast/lus_gbi.h"
+#include "fast/stereo.h"
 #include "fast/types.h"
 #include "fast/ucodehandlers.h"
 #include "backends/gfx_rendering_api.h"
@@ -729,6 +730,41 @@ class Interpreter {
 
     uint8_t AppendMtxHistory(const float m[4][4], float aspectScale);
     uint8_t GetIdentityMtxSlot();
+
+    // Stereo eye passes (see fast/stereo.h). What a matrix-history entry
+    // draws decides its viewport and scissor: the world and full-screen fills
+    // take the whole target, the two planes clip to their own content.
+    enum StereoClass : uint8_t { STEREO_FULL = 0, STEREO_WORLD = 1, STEREO_HUD = 2, STEREO_BACKDROP = 3 };
+    bool mStereoActive = false;
+    bool mStereoSeenWorld = false;
+    bool mStereoFillRect = false;
+    bool mMtxCurrentStereo = false;
+    StereoEye mStereoEye{};
+    StereoParams mStereoParams{};
+    // Vertical scale and depth terms of the game's own perspective, kept from
+    // the last one seen so 2D drawn without one still has a frustum to sit in.
+    bool mStereoPerspective = false;
+    bool mStereoAnchored = false;
+    float mStereoAnchorView[3] = { 0.0f, 0.0f, 0.0f };
+    float mStereoA = 3.3830f;
+    float mStereoB = 4.5107f;
+    float mStereoC = -1.0019551f;
+    float mStereoD = -32.03128f;
+    float mStereoLevel[4][4] = { { 1, 0, 0, 0 }, { 0, 1, 0, 0 }, { 0, 0, 1, 0 }, { 0, 0, 0, 1 } };
+    float mStereoScissor[4] = { 0.0f, 0.0f, 320.0f, 240.0f };
+    uint8_t mStereoSlotClass[MTX_HISTORY_SIZE]{};
+    uint8_t mStereoRectSlot[2] = { 0, 0 };
+    bool mStereoRectSlotValid[2] = { false, false };
+
+    bool StereoDrawing() const {
+        return mStereoActive && !mFbActive;
+    }
+    void StereoAnalyzeProjection();
+    uint8_t StereoTransform(const float mp[4][4], float out[4][4]);
+    void StereoPlane(uint8_t stereoClass, float out[4][4]) const;
+    uint8_t StereoRectSlot();
+    XYWidthHeight StereoFullArea();
+    XYWidthHeight StereoScissorArea(uint8_t stereoClass, const XYWidthHeight& full) const;
 
     // GPU palettization: the import in progress uploads raw CI indices instead of
     // decoded colors (palette lookup happens in the fragment shader).

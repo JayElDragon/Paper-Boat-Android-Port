@@ -69,6 +69,7 @@ object SettingsCatalog {
             Row("Restart Game","Restart now to apply language, text and button changes.",action="restart"),
             Row("Saved Games","Import, export and manage saved games.",action="saves"),Row("Mods","Import, enable or remove mods.",action="mods"),
             toggle("Sprint Button", "gEnhancements.SprintButton"), toggle("Free QoL Badges","gEnhancements.FreeQoLBadges"),
+            toggle("MQ Jr. Enemy Stats",FEATURE+"MQJrBalance",help="Master Quest Jr. enemy HP, levels and rewards. Next battle."),
             // Gameplay, from the PC Enhancements > Gameplay page.
             Row("Action Commands","Widen attack action command windows.","gEnhancements.ActionCommandDifficulty",listOf(0f,1f,2f,3f),listOf("Original","Easy","Easier","Easiest")),
             Row("Block Window","Timed block window. Wider overrides Dodge Master.","gEnhancements.BlockWindowMode",listOf(0f,1f,2f),listOf("3 frames","7 frames","10 frames")),
@@ -77,6 +78,23 @@ object SettingsCatalog {
             toggle("Mute I Spy Sound","gEnhancements.MuteISpySound",help="Silence the I Spy notification sound."),
             toggle("Prevent Loading Zone Storage","gEnhancements.PreventLoadingZoneStorage",help="Patch the loading zone storage glitch. Can freeze Mario midair."),
             Row("Original Engine Menu","Access all settings, enhancements, shaders and developer tools.",action="advanced"))
+        // Read by src/port/android/OpenXR.cpp. Only a headset with an OpenXR
+        // runtime uses them; on a phone they do nothing.
+        "VR Settings" -> listOf(
+            Row("OpenXR","Use the headset when one is present. Applies after Restart Game.","gXR.Enabled",listOf(0f,1f),listOf("Off","On"),1f,restart=true),
+            Row("View Mode","Flat screen, 3D diorama, or (experimental) through Mario's eyes.","gXR.Immersive",listOf(0f,1f,2f),listOf("Virtual Screen","Immersive 3D","First Person"),1f),
+            Row("First Person Size","First Person: how big the world is around you.","gXR.FirstPersonScale",listOf(40f,32f,25f,20f,15f),listOf("60%","80%","100%","125%","165%"),25f,true),
+            Row("World Size","Immersive: how big the world looks around you.","gXR.WorldScale",listOf(450f,300f,200f,150f,100f,75f),listOf("33%","50%","75%","100%","150%","200%"),150f,true),
+            toggle("Hand Hammer","gXR.Hammer",1f,"First Person: hold a hammer in your right hand; swing it to hammer."),
+            toggle("Smooth Turning","gXR.SmoothTurn",help="Turn your view with the right stick. Left stick then moves where you face."),
+            Row("Turn Speed","Smooth Turning: how fast the view turns.","gXR.TurnSpeed",listOf(45f,90f,135f,180f),listOf("Slow","Normal","Fast","Very Fast"),90f,true),
+            Row("Draw Distance","Immersive: draw scenery beyond the game's own view, so less pops in.","gXR.DrawDistance",listOf(0f,1f,2f),listOf("Normal","Far","Maximum")),
+            toggle("Level Horizon","gXR.LevelHorizon",1f,"Immersive: stand the world upright instead of tilting with the camera."),
+            Row("HUD Distance","Immersive: how far away the HUD and text float.","gXR.HudDistance",listOf(1f,1.4f,1.8f,2.5f,3.5f),listOf("1.0 m","1.4 m","1.8 m","2.5 m","3.5 m"),1.8f,true),
+            Row("Backdrop Distance","Immersive: how far away background pictures sit.","gXR.BackdropDistance",listOf(10f,20f,40f,80f),listOf("10 m","20 m","40 m","80 m"),40f,true),
+            Row("Screen Distance","Virtual screen: how far away it is.","gXR.ScreenDistance",listOf(1.5f,2f,2.5f,3.5f,5f),listOf("1.5 m","2.0 m","2.5 m","3.5 m","5.0 m"),2.5f,true),
+            Row("Screen Size","Virtual screen: how wide it is.","gXR.ScreenWidth",listOf(2f,2.8f,3.6f,5f,7f),listOf("2.0 m","2.8 m","3.6 m","5.0 m","7.0 m"),3.6f,true),
+            Row("Screen Height","Virtual screen: raise or lower it from eye level.","gXR.ScreenHeight",listOf(-.6f,-.3f,0f,.3f,.6f),listOf("-0.6 m","-0.3 m","Eye level","+0.3 m","+0.6 m"),0f,true))
         else -> emptyList()
     }
 

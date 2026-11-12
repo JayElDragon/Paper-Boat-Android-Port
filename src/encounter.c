@@ -727,6 +727,13 @@ void update_encounters_neutral(void) {
                         }
                     }
                     add_vec2D_polar(&x, &z, 24.0f, hammerDir);
+#ifdef __ANDROID__
+                    {
+                        // A hammer thrown from the headset strikes where it landed.
+                        extern s32 PaperboatXR_HammerReachPoint(f32* x, f32* y, f32* z);
+                        PaperboatXR_HammerReachPoint(&x, &y, &z);
+                    }
+#endif
                     dx = npcX - x;
                     dz = npcZ - z;
                     distance = sqrtf(SQ(dx) + SQ(dz));

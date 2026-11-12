@@ -117,4 +117,9 @@ int32_t CountModifiedActors();
 bool ExportPreset(const std::filesystem::path& path, std::string* error);
 bool ImportPreset(const std::filesystem::path& path, std::string* error);
 
+// Built-in balance layer applied under the user's overrides (same preset format).
+bool LoadBaseLayer(const std::filesystem::path& path, std::string* error);
+void ClearBaseLayer();
+int32_t CountBaseLayerActors();
+
 } // namespace ActorBlueprints

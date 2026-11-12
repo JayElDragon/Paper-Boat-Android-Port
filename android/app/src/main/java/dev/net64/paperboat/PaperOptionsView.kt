@@ -11,7 +11,7 @@ import kotlin.math.min
 /** One complete scene per page; selection only changes the paper pigment. */
 class PaperOptionsView(context:Context, initial:String, private val sounds:MenuSounds,
     private val action:(String)->Unit, private val returnToShortcut:Boolean=false):View(context) {
-    private val names=listOf("Graphics","Audio","Controls","System","Cheats")
+    private val names=listOf("Graphics","Audio","Controls","System","Cheats","VR Settings")
     private var page=initial
     private var selected=0
     private val positions=mutableMapOf<String,Int>()
@@ -26,7 +26,7 @@ class PaperOptionsView(context:Context, initial:String, private val sounds:MenuS
     private val controls=bitmap(R.drawable.controls_panel)
     private val cheatArtwork=BitmapFactory.decodeResource(resources,R.drawable.cheats_artwork)
     private val homeAreas=listOf(Rect(342,113,714,186),Rect(342,186,714,253),Rect(342,253,714,319),Rect(342,319,714,386))
-    private val tabAreas=(0..4).map{Rect(98+it*127,61,98+(it+1)*127,118)}
+    private val tabAreas=names.indices.map{Rect((PaperTabs.LEFT+it*PaperTabs.STEP).toInt(),61,(PaperTabs.LEFT+(it+1)*PaperTabs.STEP).toInt(),118)}
     private var cheatsTabSelected=false
     private val fileAreas=(0..3).map{Rect(210,133+it*60,565,193+it*60)}
     // The red edge follows the selection, as on the main menu (half its band: half the scale).
@@ -230,7 +230,7 @@ class PaperOptionsView(context:Context, initial:String, private val sounds:MenuS
         if(parent!=null){navigate(parent);sounds.move()}
         else if(returnToShortcut||page=="home"||page=="files")action("back")else navigate("home")
     }
-    /** Option lists: the five tabs plus subpages, which keep their parent's tab raised. */
+    /** Option lists: the six tabs plus subpages, which keep their parent's tab raised. */
     private fun isList()=page in names||page in SUBPAGES
     private fun tabPage()=SUBPAGES[page]?:page
     override fun onKeyDown(key:Int,event:KeyEvent):Boolean {
@@ -242,7 +242,7 @@ class PaperOptionsView(context:Context, initial:String, private val sounds:MenuS
             KeyEvent.KEYCODE_DPAD_RIGHT->if(isList())adjust(1)
             KeyEvent.KEYCODE_BUTTON_L1,KeyEvent.KEYCODE_BUTTON_R1->{
                 val at=if(cheatsTabSelected)4 else names.indexOf(tabPage()).coerceAtLeast(0)
-                val next=(at+if(key==KeyEvent.KEYCODE_BUTTON_L1)4 else 1)%5
+                val next=(at+if(key==KeyEvent.KEYCODE_BUTTON_L1)names.size-1 else 1)%names.size
                 if(next==4)openCheats()else{navigate(names[next]);sounds.move()}
             }
             KeyEvent.KEYCODE_BUTTON_A,KeyEvent.KEYCODE_ENTER,KeyEvent.KEYCODE_DPAD_CENTER->choose()

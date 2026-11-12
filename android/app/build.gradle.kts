@@ -231,6 +231,11 @@ android {
         abortOnError = false
     }
 
+    // Hands the OpenXR loader's headers and library to CMake.
+    buildFeatures {
+        prefab = true
+    }
+
     // Built-in feature archives (assets/features) are already zips; storing
     // them uncompressed keeps the APK small and lets GameAssets read lengths.
     androidResources {
@@ -249,5 +254,7 @@ dependencies {
     androidTestImplementation("androidx.test:runner:1.6.2")
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.activity:activity-ktx:1.9.3")
+    // Khronos OpenXR loader (libopenxr_loader.so + headers, as a prefab AAR).
+    implementation("org.khronos.openxr:openxr_loader_for_android:1.1.65")
 }
 

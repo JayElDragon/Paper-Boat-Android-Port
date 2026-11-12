@@ -2191,13 +2191,25 @@ typedef struct {
 #define DISPLAYCONTEXT_GFX_COUNT 0x2080
 #endif
 
+// The sizes above assume the game's own culling, which keeps a frame's worth
+// of models inside what an N64 could hold. The headset's draw distance setting
+// (and first person) draws models the camera cannot see, so a large room
+// overflowed these buffers and tripped the overflow assert in main_loop.c.
+#ifdef __ANDROID__
+#define DISPLAYCONTEXT_MAIN_GFX_COUNT (DISPLAYCONTEXT_GFX_COUNT * 4)
+#define DISPLAYCONTEXT_MTX_COUNT 0x800
+#else
+#define DISPLAYCONTEXT_MAIN_GFX_COUNT DISPLAYCONTEXT_GFX_COUNT
+#define DISPLAYCONTEXT_MTX_COUNT 0x200
+#endif
+
 typedef struct {
     /* 0x00000 */ LookAt lookAt;
     /* 0x00020 */ Hilite hilite;
     /* 0x00030 */ Mtx camPerspMatrix[8]; // could only be length 4, unsure
-    /* 0x00230 */ Gfx mainGfx[DISPLAYCONTEXT_GFX_COUNT];
+    /* 0x00230 */ Gfx mainGfx[DISPLAYCONTEXT_MAIN_GFX_COUNT];
     /* 0x10630 */ Gfx backgroundGfx[0x600]; // used by gfx_task_background (enlarged: widescreen tiles the scrolling bg across the full width, ~3-4x the texrects)
-    /* 0x11630 */ Mtx matrixStack[0x200];
+    /* 0x11630 */ Mtx matrixStack[DISPLAYCONTEXT_MTX_COUNT];
 } DisplayContext; // size = 0x19630
 
 typedef struct PlayerSpinState {

@@ -1,4 +1,5 @@
 #include "TouchControls.h"
+#include "../android/OpenXR.h"
 
 #include <SDL2/SDL.h>
 #include <imgui.h>
@@ -162,6 +163,10 @@ void RegisterCVars() {
 
 bool Enabled() {
     RegisterCVars();
+    // Nothing to touch in a headset; the controllers arrive as a gamepad.
+    if (PaperboatXR_IsPresenting()) {
+        return false;
+    }
     return CVarGetInteger(CVAR_TOUCH("Enabled"), TOUCH_CONTROLS_DEFAULT) != 0;
 }
 

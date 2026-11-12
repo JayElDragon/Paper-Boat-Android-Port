@@ -151,8 +151,18 @@ object GameAssets {
     fun stageFeatures(context: Context): String? = try {
         val target = featuresDir(context).also { it.mkdirs() }
         for (name in context.assets.list(FEATURES).orEmpty()) {
-            if (!name.endsWith(".o2r")) continue
+            // Archives, plus balance presets such as mqjr_balance.json.
+            if (!name.endsWith(".o2r") && !name.endsWith(".json")) continue
             val destination = File(target, name)
+            if (name.endsWith(".json")) {
+                // Small and compressed in the APK, so openFd can't size it: compare contents.
+                val bytes = context.assets.open("$FEATURES/$name").use { it.readBytes() }
+                if (destination.isFile && destination.readBytes().contentEquals(bytes)) continue
+                val partial = File(target, "$name.tmp")
+                partial.writeBytes(bytes)
+                check(partial.renameTo(destination)) { "Could not install $name" }
+                continue
+            }
             val length = context.assets.openFd("$FEATURES/$name").use { it.length }
             if (destination.length() == length) continue
             val partial = File(target, "$name.tmp")

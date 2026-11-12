@@ -7,6 +7,7 @@
 #include "nlohmann/json.hpp"
 #include "port/build.h"
 #include "port/enhancements/PortEnhancements.h"
+#include "port/enhancements/gameplay/ActorBlueprints.h"
 #include "port/interpolation/FrameInterpolation.h"
 #include "port/ui/cvar_prefixes.h"
 #include "port/audio/AudioVolume.h"
@@ -242,6 +243,29 @@ static void MountBuiltInFeatures() {
     // with alternate assets on. Android has no Tab key to flip it.
     if (hdTextures || cleanText || buttons) {
         CVarSetInteger("gEnhancements.Mods.AlternateAssets", 1);
+    }
+}
+
+// MQ Jr. enemy stats as a balance layer under the actor blueprint editor.
+// Blueprints are copied on load, so a change applies from the next battle.
+static void UpdateMQJrBalance() {
+    static int applied = -1;
+    const int wanted = CVarGetInteger(CVAR_FEATURE("MQJrBalance"), 0) != 0 ? 1 : 0;
+    if (wanted == applied) {
+        return;
+    }
+    applied = wanted;
+    if (!wanted) {
+        ActorBlueprints::ClearBaseLayer();
+        SPDLOG_INFO("MQ Jr. balance off");
+        return;
+    }
+    std::string error;
+    const auto path = Ship::Context::GetPathRelativeToAppDirectory("features/mqjr_balance.json");
+    if (ActorBlueprints::LoadBaseLayer(path, &error)) {
+        SPDLOG_INFO("MQ Jr. balance on: {} enemy types", ActorBlueprints::CountBaseLayerActors());
+    } else {
+        SPDLOG_WARN("MQ Jr. balance unavailable: {}", error);
     }
 }
 
@@ -1058,6 +1082,7 @@ void GameEngine::StartFrame() const {
 
 #ifdef __ANDROID__
     UpdateBuiltInPostPasses();
+    UpdateMQJrBalance();
 #endif
 
     const bool dpadAsLeftStick = CVarGetInteger(CVAR_SETTING("Controls.DPadAsLeftStick"), 0) != 0;
@@ -1169,6 +1194,13 @@ void GameEngine::AudioExit() {
     }
 }
 
+// Which of a game frame's interpolated draws is in progress, for code that has
+// to interpolate something the matrix recorder does not cover (OpenXR.cpp).
+extern "C" {
+int gPaperboatInterpIndex = 0;
+int gPaperboatInterpCount = 1;
+}
+
 void GameEngine::RunCommands(Gfx* Commands, const std::vector<std::unordered_map<Mtx*, MtxF>>& mtx_replacements) {
     auto wnd = std::dynamic_pointer_cast<Fast::Fast3dWindow>(Ship::Context::GetRawInstance()->GetWindow());
 
@@ -1190,6 +1222,8 @@ void GameEngine::RunCommands(Gfx* Commands, const std::vector<std::unordered_map
             interpreter->mInterpolationIndex++;
             continue;
         }
+        gPaperboatInterpIndex = static_cast<int>(i);
+        gPaperboatInterpCount = static_cast<int>(mtx_replacements.size());
         wnd->DrawAndRunGraphicsCommands(Commands, mtx_replacements[i], {});
         OS_ViNotifyPresent();
         interpreter->mInterpolationIndex++;

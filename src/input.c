@@ -29,6 +29,12 @@ enum {
     DIR_INWARD = 1, // track inward motion and determine when the stick direction should be released
 };
 
+#ifdef __ANDROID__
+extern s32 PaperboatXR_InjectedButtons(void);
+#else
+#define PaperboatXR_InjectedButtons() 0
+#endif
+
 void reset_input_state(void) {
     gGameStatusPtr->curButtons[0] = 0;
     gGameStatusPtr->pressedButtons[0] = 0;
@@ -79,6 +85,9 @@ void update_input(void) {
     if (!hasInput) {
         return;
     }
+
+    // A hammer swing made with the headset controller counts as its button.
+    contData->button |= PaperboatXR_InjectedButtons();
 
     stickX = contData->stick_x;
     stickY = contData->stick_y;

@@ -2821,6 +2821,13 @@ void mdl_update_transform_matrices(void) {
     build_custom_gfx();
 }
 
+// 0 outside a headset's immersive view; otherwise the VR draw distance setting.
+#ifdef __ANDROID__
+extern s32 PaperboatXR_DrawDistance(void);
+#else
+#define PaperboatXR_DrawDistance() 0
+#endif
+
 void render_models(void) {
     RenderTask rt;
     RenderTask* rtPtr = &rt;
@@ -2843,6 +2850,14 @@ void render_models(void) {
     s32 i;
 
     f32 wsCullX = GameEngine_GetAspectRatio() * (3.0f / 4.0f);
+    // In a headset the player sees far outside the game camera's own narrow
+    // view, so the VR draw distance setting widens the test or drops it.
+    f32 wsCullY = 1.0f;
+    s32 xrDrawDistance = PaperboatXR_DrawDistance();
+    if (xrDrawDistance == 1) {
+        wsCullX *= 3.0f;
+        wsCullY = 3.0f;
+    }
 
 #define TEST_POINT_VISIBILITY \
     outX = (m00 * xComp) + (m10 * yComp) + (m20 * zComp) + m30; \
@@ -2857,7 +2872,7 @@ void render_models(void) {
     xComp = outX * outW; \
     yComp = outY * outW; \
     zComp = outZ * outW; \
-    if (zComp > -1.0f && xComp >= -wsCullX && xComp <= wsCullX && yComp >= -1.0f && yComp <= 1.0f) { \
+    if (xrDrawDistance >= 2 || (zComp > -1.0f && xComp >= -wsCullX && xComp <= wsCullX && yComp >= -wsCullY && yComp <= wsCullY)) { \
         break; \
     }
 

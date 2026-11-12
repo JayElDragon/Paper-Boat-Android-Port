@@ -24,6 +24,12 @@ HammerHitData* HammerHit = &D_802B6E90;
 
 void action_hammer_end_swing(void);
 
+#ifdef __ANDROID__
+extern s32 PaperboatXR_HammerReach(f32* x, f32* y, f32* z, f32* yaw);
+#else
+#define PaperboatXR_HammerReach(x, y, z, yaw) 0
+#endif
+
 s32 action_hammer_is_swinging_away(s32 animID) {
     if (animID & SPRITE_ID_BACK_FACING) {
         return true;
@@ -140,6 +146,10 @@ HitID action_hammer_test_swing_collision(void) {
     playerX = playerStatus->pos.x;
     playerY = playerStatus->pos.y;
     playerZ = playerStatus->pos.z;
+    // A hammer thrown from the headset strikes where it landed.
+    if (PaperboatXR_HammerReach(&playerX, &playerY, &playerZ, &yaw)) {
+        sin_cos_rad(DEG_TO_RAD(yaw), &outSinTheta, &outCosTheta);
+    }
 
     // check collision along 16 points in a line away from the player
     for (i = 1; i < 16; i++) {
@@ -313,6 +323,10 @@ void action_hammer_end_swing(void) {
     playerX = playerStatus->pos.x;
     playerY = playerStatus->pos.y;
     playerZ = playerStatus->pos.z;
+    // A hammer thrown from the headset strikes where it landed.
+    if (PaperboatXR_HammerReach(&playerX, &playerY, &playerZ, &yaw)) {
+        sin_cos_rad(DEG_TO_RAD(yaw), &outSinTheta, &outCosTheta);
+    }
 
     // check collision along 16 points in a line away from the player
     for (i = 1; i < 16; i++) {

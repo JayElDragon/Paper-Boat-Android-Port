@@ -1494,6 +1494,12 @@ void render_player(void) {
     }
 }
 
+#ifdef __ANDROID__
+extern s32 PaperboatXR_FirstPerson(void);
+#else
+#define PaperboatXR_FirstPerson() 0
+#endif
+
 void render_player_model(void) {
     RenderTask task;
     RenderTask* rtPtr = &task;
@@ -1527,7 +1533,8 @@ void render_player_model(void) {
             playerStatus->prevAlpha = 0;
         }
 
-        if (!(playerStatus->animFlags & PA_FLAG_INVISIBLE)) {
+        // In the headset's first-person view the player is looking out of Mario.
+        if (!(playerStatus->animFlags & PA_FLAG_INVISIBLE) && !PaperboatXR_FirstPerson()) {
             rtPtr->appendGfxArg = playerStatus;
             rtPtr->dist = -z;
             rtPtr->renderMode = playerStatus->renderMode;

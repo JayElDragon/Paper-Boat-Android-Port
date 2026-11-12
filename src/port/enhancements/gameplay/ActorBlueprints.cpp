@@ -212,6 +212,9 @@ static bool IsListedEnemy(int32_t actorType) {
 // The UI thread edits overrides while the game thread reads them inside battle hooks.
 static std::mutex sMutex;
 static std::map<int32_t, Override> sOverrides;
+// Built-in balance layer (e.g. MQ Jr. stats) under the user's own edits. Not
+// autosaved and not gated by the editor's Enabled toggle.
+static std::map<int32_t, Override> sBaseOverrides;
 static std::vector<CatalogEntry> sCatalog;
 static std::unordered_map<int32_t, size_t> sCatalogIndex;
 static bool sCatalogBuilt = false;
@@ -618,6 +621,55 @@ bool IsEnabled() {
     return CVarGetInteger(CVAR_ACTOR_BLUEPRINTS_ENABLED, 1) != 0;
 }
 
+// Caller holds sMutex. Base layer first, then the user's fields on top.
+static bool Effective(int32_t actorType, Override* out) {
+    Override merged;
+    auto base = sBaseOverrides.find(actorType);
+    if (base != sBaseOverrides.end()) {
+        merged = base->second;
+    }
+    if (IsEnabled()) {
+        auto it = sOverrides.find(actorType);
+        if (it != sOverrides.end()) {
+            for (int32_t i = 0; i < FIELD_COUNT; i++) {
+                if (it->second.isSet[i]) {
+                    merged.isSet[i] = true;
+                    merged.value[i] = it->second.value[i];
+                }
+            }
+            for (int32_t i = 0; i < DEFENSE_ELEMENT_COUNT; i++) {
+                if (it->second.defenseSet[i]) {
+                    merged.defenseSet[i] = true;
+                    merged.defenseDelta[i] = it->second.defenseDelta[i];
+                }
+            }
+        }
+    }
+    *out = merged;
+    return merged.Any();
+}
+
+bool LoadBaseLayer(const std::filesystem::path& path, std::string* error) {
+    ordered_json root;
+    std::map<int32_t, Override> loaded;
+    if (!ReadJson(path, &root, error) || !DeserializeOverrides(root, &loaded, error)) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(sMutex);
+    sBaseOverrides = std::move(loaded);
+    return true;
+}
+
+void ClearBaseLayer() {
+    std::lock_guard<std::mutex> lock(sMutex);
+    sBaseOverrides.clear();
+}
+
+int32_t CountBaseLayerActors() {
+    std::lock_guard<std::mutex> lock(sMutex);
+    return (int32_t) sBaseOverrides.size();
+}
+
 void SetEnabled(bool enabled) {
     CVarSetInteger(CVAR_ACTOR_BLUEPRINTS_ENABLED, enabled ? 1 : 0);
     CVarSave();
@@ -716,18 +768,16 @@ bool ImportPreset(const std::filesystem::path& path, std::string* error) {
 }
 
 static void ApplyAttackOverride(int32_t actorType, int32_t* damage) {
-    if (!IsEnabled() || *damage <= 0) {
+    if (*damage <= 0) {
         return;
     }
 
     Override ov;
     {
         std::lock_guard<std::mutex> lock(sMutex);
-        auto it = sOverrides.find(actorType);
-        if (it == sOverrides.end()) {
+        if (!Effective(actorType, &ov)) {
             return;
         }
-        ov = it->second;
     }
 
     int32_t scaled = *damage;
@@ -757,14 +807,9 @@ static void RegisterActorBlueprints_Init() {
             if (sCatalogIndex.find(original->type) == sCatalogIndex.end()) {
                 AddToCatalog(original, CHAPTER_OTHER);
             }
-            if (!IsEnabled()) {
+            if (!Effective(original->type, &ov) || !HasBlueprintFields(ov)) {
                 return;
             }
-            auto it = sOverrides.find(original->type);
-            if (it == sOverrides.end() || !HasBlueprintFields(it->second)) {
-                return;
-            }
-            ov = it->second;
         }
 
         std::unique_ptr<ActorBlueprint>& copy = sBlueprintCopies[original];
@@ -774,6 +819,8 @@ static void RegisterActorBlueprints_Init() {
         *copy = *original;
         ApplyToBlueprint(copy.get(), ov);
         *ev->blueprint = copy.get();
+        SPDLOG_INFO("ActorBlueprints: type {:#04x} maxHP {} -> {}, level {} -> {}", original->type,
+                    original->maxHP, copy->maxHP, original->level, copy->level);
     });
 
     REGISTER_LISTENER(OnEnemyAttackDamage, EVENT_PRIORITY_NORMAL, [](IEvent* event) {
@@ -788,24 +835,18 @@ static void RegisterActorBlueprints_Init() {
 
     REGISTER_LISTENER(OnActorDefenseCheck, EVENT_PRIORITY_NORMAL, [](IEvent* event) {
         OnActorDefenseCheck* ev = (OnActorDefenseCheck*) event;
-        if (!IsEnabled() || ev->defenseTable == nullptr || ev->target == nullptr
-            || ev->target->actorBlueprint == nullptr)
-        {
+        if (ev->defenseTable == nullptr || ev->target == nullptr || ev->target->actorBlueprint == nullptr) {
             return;
         }
 
         Override ov;
         {
             std::lock_guard<std::mutex> lock(sMutex);
-            auto it = sOverrides.find(ev->target->actorBlueprint->type);
-            if (it == sOverrides.end()
-                || std::none_of(
-                    std::begin(it->second.defenseSet), std::end(it->second.defenseSet), [](bool set) { return set; }
-                ))
+            if (!Effective(ev->target->actorBlueprint->type, &ov)
+                || std::none_of(std::begin(ov.defenseSet), std::end(ov.defenseSet), [](bool set) { return set; }))
             {
                 return;
             }
-            ov = it->second;
         }
 
         int32_t defense = 255;

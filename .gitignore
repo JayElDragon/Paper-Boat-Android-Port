@@ -121,6 +121,7 @@ android/key.properties
 
 # Third-party feature packs (see ANDROID.md): never commit, supply your own copies
 android/app/src/main/assets/features/*.o2r
+android/app/src/main/assets/features/*.json
 docs/user-feature-packs/
 
 # Game data

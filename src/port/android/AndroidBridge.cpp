@@ -56,6 +56,13 @@ std::string ToStdString(JNIEnv* env, jstring value) {
 
 extern "C" {
 
+// The launcher runs in its own process, so settings changed there while the
+// game is paused behind it only exist as the pending file. Coming back to the
+// foreground asks for that file to be read again.
+void PaperboatRecheckPendingSettings() {
+    settingsDirty.store(true);
+}
+
 void PaperboatApplyPendingSettings() {
     auto context = Ship::Context::GetRawInstance();
     if (!context || !context->GetWindow()) return;
@@ -79,6 +86,7 @@ void PaperboatApplyPendingSettings() {
         const auto key = line.substr(first + 1, second - first - 1);
         if (key.rfind("gSettings.",0) != 0 && key.rfind("gTouchControls.",0) != 0
             && key.rfind("gEnhancements.",0) != 0 && key.rfind("gCheats.",0) != 0
+            && key.rfind("gXR.",0) != 0
             && key != "gTextureFilter" && key != "gVsyncEnabled") continue;
         try {
             const float value = std::stof(line.substr(second+1));

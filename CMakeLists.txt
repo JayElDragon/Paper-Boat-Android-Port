@@ -489,6 +489,12 @@ if(ANDROID)
         target_include_directories(${PROJECT_NAME} PRIVATE ${libzip_SOURCE_DIR}/lib ${libzip_BINARY_DIR})
     endif()
     target_link_libraries(${PROJECT_NAME} PRIVATE libzip::zip GLESv3 EGL android log)
+
+    # The Khronos loader, from the Gradle dependency via prefab. It finds the
+    # headset's runtime at run time; on a phone there is none and the game
+    # presents to the screen as before (src/port/android/OpenXR.cpp).
+    find_package(OpenXR REQUIRED CONFIG)
+    target_link_libraries(${PROJECT_NAME} PRIVATE OpenXR::openxr_loader)
 endif()
 
 if(EMSCRIPTEN)

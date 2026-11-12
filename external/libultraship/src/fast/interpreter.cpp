@@ -183,6 +183,12 @@ uint8_t Interpreter::AppendMtxHistory(const float m[4][4], float aspectScale) {
     if (mMtxCurrentValid && slot == mMtxHistoryCurrent) {
         mMtxCurrentValid = false;
     }
+    mStereoSlotClass[slot] = STEREO_FULL;
+    for (int i = 0; i < 2; i++) {
+        if (mStereoRectSlotValid[i] && slot == mStereoRectSlot[i]) {
+            mStereoRectSlotValid[i] = false;
+        }
+    }
     // A new entry at this slot invalidates any palette mapping that pointed here
     if (mBatchSlotForHistory[slot] >= 0) {
         Flush();
@@ -200,6 +206,233 @@ uint8_t Interpreter::GetIdentityMtxSlot() {
         mMtxIdentityValid = true;
     }
     return mMtxIdentityEntry;
+}
+
+// ------------------------------------------------------------------ stereo --
+
+StereoHooks gStereoHooks = {};
+
+// The eye's projection, keeping the game's own depth mapping (c, d) so depth
+// precision, fog and decals behave as they do on a flat screen.
+static void StereoEyeProjection(const StereoEye& eye, float c, float d, float out[4][4]) {
+    const float width = eye.tanRight - eye.tanLeft;
+    const float height = eye.tanUp - eye.tanDown;
+    memset(out, 0, sizeof(float) * 16);
+    out[0][0] = 2.0f / width;
+    out[1][1] = 2.0f / height;
+    out[2][0] = (eye.tanRight + eye.tanLeft) / width;
+    out[2][1] = (eye.tanUp + eye.tanDown) / height;
+    out[2][2] = c;
+    out[2][3] = -1.0f;
+    out[3][2] = d;
+}
+
+// A plane facing the game camera, sized to its frustum at [distance]: clip
+// coordinates in, eye clip coordinates out. Seen from the camera's own position
+// it covers exactly what the flat screen did.
+void Interpreter::StereoPlane(uint8_t stereoClass, float out[4][4]) const {
+    const float distance = stereoClass == STEREO_BACKDROP ? mStereoParams.backdropDistance : mStereoParams.hudDistance;
+    const float b = mStereoB;
+    const float a = b / (4.0f / 3.0f);
+    const float onPlane[4][4] = {
+        { distance / a, 0.0f, 0.0f, 0.0f },
+        { 0.0f, distance / b, 0.0f, 0.0f },
+        { 0.0f, 0.0f, 0.0f, 0.0f },
+        { 0.0f, 0.0f, -distance, 1.0f },
+    };
+    float projection[4][4];
+    StereoEyeProjection(mStereoEye, mStereoC, mStereoD, projection);
+    MatrixMul(out, onPlane, mStereoLevel);
+    MatrixMul(out, out, mStereoEye.planeInv);
+    MatrixMul(out, out, projection);
+    // Depth keeps the order the 2D layers were given rather than the plane's
+    // real distance; halved so a turned head cannot push it past the clip planes.
+    const float centreW = out[3][3];
+    out[0][2] = out[1][2] = out[3][2] = 0.0f;
+    out[2][0] = out[2][1] = out[2][3] = 0.0f;
+    out[2][2] = centreW * 0.5f;
+}
+
+// Called when the game loads a projection. It loads view * perspective as one
+// matrix; with a rigid view matrix the perspective's terms can be read back out
+// of the product. Matrices multiplied on afterwards leave them unchanged.
+void Interpreter::StereoAnalyzeProjection() {
+    const float (*p)[4] = mRsp->P_matrix;
+    mStereoPerspective = false;
+    int row = 0;
+    for (int i = 1; i < 3; i++) {
+        if (fabsf(p[i][3]) > fabsf(p[row][3])) {
+            row = i;
+        }
+    }
+    if (fabsf(p[row][3]) <= 1e-6f) {
+        return;
+    }
+    const float a = sqrtf(p[0][0] * p[0][0] + p[1][0] * p[1][0] + p[2][0] * p[2][0]);
+    const float b = sqrtf(p[0][1] * p[0][1] + p[1][1] * p[1][1] + p[2][1] * p[2][1]);
+    const float c = -p[row][2] / p[row][3];
+    const float d = p[3][2] + c * p[3][3];
+    if (a <= 1e-6f || b <= 1e-6f || fabsf(d) <= 1e-6f) {
+        return;
+    }
+    if (b != mStereoB || c != mStereoC || d != mStereoD) {
+        mStereoRectSlotValid[0] = mStereoRectSlotValid[1] = false;
+    }
+    mStereoA = a;
+    mStereoB = b;
+    mStereoC = c;
+    mStereoD = d;
+    mStereoPerspective = true;
+
+    // First person: find the anchor in this camera's view space. A projection
+    // with no view in it is an effect's own (lens flares, overlays), not the
+    // world camera, and stays where the camera would have put it.
+    const bool hasView = fabsf(p[3][0]) + fabsf(p[3][1]) + fabsf(p[0][3]) + fabsf(p[1][3]) + fabsf(p[0][1]) +
+                             fabsf(p[1][0]) > 1e-4f;
+    mStereoAnchored = mStereoParams.anchorEnabled && hasView;
+    if (mStereoAnchored) {
+        const float* w = mStereoParams.anchor;
+        mStereoAnchorView[0] = (w[0] * p[0][0] + w[1] * p[1][0] + w[2] * p[2][0] + p[3][0]) / a;
+        mStereoAnchorView[1] = (w[0] * p[0][1] + w[1] * p[1][1] + w[2] * p[2][1] + p[3][1]) / b;
+        // The perspective's w is minus the view-space depth.
+        mStereoAnchorView[2] = -(w[0] * p[0][3] + w[1] * p[1][3] + w[2] * p[2][3] + p[3][3]);
+    }
+
+    // World "up" as the game camera sees it, and the smallest rotation that
+    // stands it upright again (pitch and roll out, heading untouched).
+    float level[4][4] = { { 1, 0, 0, 0 }, { 0, 1, 0, 0 }, { 0, 0, 1, 0 }, { 0, 0, 0, 1 } };
+    float up[3] = { p[1][0] / a, p[1][1] / b, -p[1][3] };
+    const float length = sqrtf(up[0] * up[0] + up[1] * up[1] + up[2] * up[2]);
+    if (mStereoParams.levelHorizon && length > 1e-6f && up[1] / length > -0.9f) {
+        up[0] /= length;
+        up[1] /= length;
+        up[2] /= length;
+        // Rodrigues, for the rotation taking `up` onto +Y; axis = up x Y.
+        const float vx = -up[2];
+        const float vz = up[0];
+        const float k = 1.0f / (1.0f + up[1]);
+        const float r[3][3] = {
+            { 1.0f - k * vz * vz, -vz, k * vx * vz },
+            { vz, 1.0f - k * (vx * vx + vz * vz), -vx },
+            { k * vx * vz, vx, 1.0f - k * vx * vx },
+        };
+        // Row-vector form: the transpose.
+        for (int i = 0; i < 3; i++) {
+            for (int j = 0; j < 3; j++) {
+                level[i][j] = r[j][i];
+            }
+        }
+    }
+    if (memcmp(level, mStereoLevel, sizeof(level)) != 0) {
+        memcpy(mStereoLevel, level, sizeof(level));
+        mStereoRectSlotValid[0] = mStereoRectSlotValid[1] = false;
+    }
+}
+
+// Rewrites a model-view-projection for the current eye and says what it draws.
+uint8_t Interpreter::StereoTransform(const float mp[4][4], float out[4][4]) {
+    if (mStereoPerspective) {
+        // Undo the game's perspective, move into the eye, apply the eye's.
+        const float inverse[4][4] = {
+            { 1.0f / mStereoA, 0.0f, 0.0f, 0.0f },
+            { 0.0f, 1.0f / mStereoB, 0.0f, 0.0f },
+            { 0.0f, 0.0f, 0.0f, 1.0f / mStereoD },
+            { 0.0f, 0.0f, -1.0f, mStereoC / mStereoD },
+        };
+        // Optionally with the far plane pushed out: recover near and far from
+        // the game's depth terms, then rebuild the terms for the longer range.
+        float c = mStereoC;
+        float d = mStereoD;
+        if ((mStereoParams.farScale > 1.0f || mStereoParams.nearClip > 0.0f) && fabsf(c - 1.0f) > 1e-6f &&
+            fabsf(c + 1.0f) > 1e-6f) {
+            const float nearClip = mStereoParams.nearClip > 0.0f ? mStereoParams.nearClip : d / (c - 1.0f);
+            const float farClip = d / (c + 1.0f) * std::max(1.0f, mStereoParams.farScale);
+            if (nearClip > 0.0f && farClip > nearClip) {
+                c = (nearClip + farClip) / (nearClip - farClip);
+                d = 2.0f * nearClip * farClip / (nearClip - farClip);
+            }
+        }
+        float projection[4][4];
+        StereoEyeProjection(mStereoEye, c, d, projection);
+        MatrixMul(out, mp, inverse);
+        if (mStereoAnchored) {
+            const float toAnchor[4][4] = {
+                { 1.0f, 0.0f, 0.0f, 0.0f },
+                { 0.0f, 1.0f, 0.0f, 0.0f },
+                { 0.0f, 0.0f, 1.0f, 0.0f },
+                { -mStereoAnchorView[0], -mStereoAnchorView[1], -mStereoAnchorView[2], 1.0f },
+            };
+            MatrixMul(out, out, toAnchor);
+        }
+        MatrixMul(out, out, mStereoLevel);
+        MatrixMul(out, out, mStereoEye.headInv);
+        MatrixMul(out, out, projection);
+        mStereoSeenWorld = true;
+        return STEREO_WORLD;
+    }
+
+    const uint8_t stereoClass = mStereoSeenWorld ? STEREO_HUD : STEREO_BACKDROP;
+    float plane[4][4];
+    StereoPlane(stereoClass, plane);
+    MatrixMul(out, mp, plane);
+    return stereoClass;
+}
+
+// Rectangles arrive as finished clip coordinates; in an eye pass they go
+// through the plane they belong on instead of the identity entry.
+uint8_t Interpreter::StereoRectSlot() {
+    const uint8_t stereoClass = mStereoSeenWorld ? STEREO_HUD : STEREO_BACKDROP;
+    const int index = stereoClass == STEREO_HUD ? 0 : 1;
+    if (!mStereoRectSlotValid[index]) {
+        float plane[4][4];
+        StereoPlane(stereoClass, plane);
+        const uint8_t slot = AppendMtxHistory(plane, 1.0f);
+        mStereoSlotClass[slot] = stereoClass;
+        mStereoRectSlot[index] = slot;
+        mStereoRectSlotValid[index] = true;
+    }
+    return mStereoRectSlot[index];
+}
+
+XYWidthHeight Interpreter::StereoFullArea() {
+    XYWidthHeight area = { 0, (int16_t)mNativeDimensions.height, (uint32_t)mNativeDimensions.width,
+                           (uint32_t)mNativeDimensions.height };
+    AdjustVIewportOrScissor(&area);
+    return area;
+}
+
+// The game's scissor, carried onto the plane: the box around its four corners.
+XYWidthHeight Interpreter::StereoScissorArea(uint8_t stereoClass, const XYWidthHeight& full) const {
+    float plane[4][4];
+    StereoPlane(stereoClass, plane);
+    const float halfWidth = mNativeDimensions.width / 2.0f;
+    const float halfHeight = mNativeDimensions.height / 2.0f;
+    float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
+    for (int corner = 0; corner < 4; corner++) {
+        const float x = mStereoScissor[(corner & 1) ? 2 : 0] / halfWidth - 1.0f;
+        const float y = 1.0f - mStereoScissor[(corner & 2) ? 3 : 1] / halfHeight;
+        const float w = x * plane[0][3] + y * plane[1][3] + plane[3][3];
+        if (w <= 1e-4f) {
+            // Behind the eye: no meaningful box, and nothing visible to clip.
+            return full;
+        }
+        const float ndcX = (x * plane[0][0] + y * plane[1][0] + plane[3][0]) / w;
+        const float ndcY = (x * plane[0][1] + y * plane[1][1] + plane[3][1]) / w;
+        minX = std::min(minX, ndcX);
+        maxX = std::max(maxX, ndcX);
+        minY = std::min(minY, ndcY);
+        maxY = std::max(maxY, ndcY);
+    }
+    minX = std::clamp(minX, -1.0f, 1.0f);
+    maxX = std::clamp(maxX, -1.0f, 1.0f);
+    minY = std::clamp(minY, -1.0f, 1.0f);
+    maxY = std::clamp(maxY, -1.0f, 1.0f);
+    XYWidthHeight area;
+    area.x = (int16_t)(full.x + floorf((minX + 1.0f) * 0.5f * full.width));
+    area.y = (int16_t)(full.y + floorf((minY + 1.0f) * 0.5f * full.height));
+    area.width = (uint32_t)ceilf((maxX - minX) * 0.5f * full.width) + 1;
+    area.height = (uint32_t)ceilf((maxY - minY) * 0.5f * full.height) + 1;
+    return area;
 }
 
 // The color-combiner formula runs on the GPU; this latches its constant operands
@@ -3375,6 +3608,7 @@ void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
     if (parameters & mtx_projection) {
         if (parameters & mtx_load) {
             memcpy(mRsp->P_matrix, matrix, sizeof(matrix));
+            StereoAnalyzeProjection();
         } else {
             MatrixMul(mRsp->P_matrix, matrix, mRsp->P_matrix);
         }
@@ -3442,10 +3676,20 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
     // The position transform runs in the vertex shader: capture the current
     // model-view-projection (with the widescreen aspect scale folded in) in the
     // matrix history once per matrix/aspect change and tag each vertex with it.
-    const float aspectScale = AdjXForAspectRatio(1.0f);
-    if (!mMtxCurrentValid || aspectScale != mMtxCurrentAspect) {
-        mMtxHistoryCurrent = AppendMtxHistory(mRsp->MP_matrix, aspectScale);
+    // In a stereo eye pass the eye's projection already has the right shape.
+    const bool stereo = StereoDrawing();
+    const float aspectScale = stereo ? 1.0f : AdjXForAspectRatio(1.0f);
+    if (!mMtxCurrentValid || aspectScale != mMtxCurrentAspect || stereo != mMtxCurrentStereo) {
+        if (stereo) {
+            float eyeMatrix[4][4];
+            const uint8_t stereoClass = StereoTransform(mRsp->MP_matrix, eyeMatrix);
+            mMtxHistoryCurrent = AppendMtxHistory(eyeMatrix, 1.0f);
+            mStereoSlotClass[mMtxHistoryCurrent] = stereoClass;
+        } else {
+            mMtxHistoryCurrent = AppendMtxHistory(mRsp->MP_matrix, aspectScale);
+        }
         mMtxCurrentAspect = aspectScale;
+        mMtxCurrentStereo = stereo;
         mMtxCurrentValid = true;
     }
 
@@ -3592,7 +3836,26 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         mRenderingState.decal_mode = zmode_decal;
     }
 
-    if (mRdp->viewport_or_scissor_changed) {
+    if (StereoDrawing()) {
+        // The eye's projection fills the target, whatever window the game set
+        // up; only the 2D planes keep a scissor, moved onto the plane with them.
+        const XYWidthHeight full = StereoFullArea();
+        const uint8_t stereoClass = mStereoSlotClass[v1->mtx_slot];
+        const XYWidthHeight scissor =
+            stereoClass >= STEREO_HUD ? StereoScissorArea(stereoClass, full) : full;
+        if (memcmp(&full, &mRenderingState.viewport, sizeof(full)) != 0) {
+            Flush();
+            mRapi->SetViewport(full.x, full.y, full.width, full.height);
+            mRenderingState.viewport = full;
+        }
+        if (memcmp(&scissor, &mRenderingState.scissor, sizeof(scissor)) != 0) {
+            Flush();
+            mRapi->SetScissor(scissor.x, scissor.y, scissor.width, scissor.height);
+            mRenderingState.scissor = scissor;
+        }
+        // Whatever draws next outside the eye pass has to set its own again.
+        mRdp->viewport_or_scissor_changed = true;
+    } else if (mRdp->viewport_or_scissor_changed) {
         if (memcmp(&mRdp->viewport, &mRenderingState.viewport, sizeof(mRdp->viewport)) != 0) {
             Flush();
             mRapi->SetViewport(mRdp->viewport.x, mRdp->viewport.y, mRdp->viewport.width, mRdp->viewport.height);
@@ -4472,6 +4735,13 @@ void Interpreter::GfxDpSetScissor(uint32_t mode, uint32_t ulx, uint32_t uly, uin
     mRdp->scissor.width = width;
     mRdp->scissor.height = height;
 
+    if (!mFbActive) {
+        mStereoScissor[0] = ulx / 4.0f;
+        mStereoScissor[1] = uly / 4.0f;
+        mStereoScissor[2] = lrx / 4.0f;
+        mStereoScissor[3] = lry / 4.0f;
+    }
+
     AdjustVIewportOrScissor(&mRdp->scissor);
 
     mRdp->viewport_or_scissor_changed = true;
@@ -4940,8 +5210,25 @@ void Interpreter::GfxDrawRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_
     lrxf = lrxf / (4.0f * HALF_SCREEN_WIDTH(mActiveFrameBuffer)) - 1.0f;
     lryf = -(lryf / (4.0f * HALF_SCREEN_HEIGHT(mActiveFrameBuffer))) + 1.0f;
 
-    ulxf = AdjXForAspectRatio(ulxf);
-    lrxf = AdjXForAspectRatio(lrxf);
+    // In a stereo eye pass a plain fill over (nearly) the whole screen is a
+    // clear or a fade and covers the whole eye. Everything else is HUD or
+    // backdrop and sits on its plane, which does its own 4:3 placement. That
+    // includes full-screen pictures: the eyes' fields of view are lopsided in
+    // opposite directions, so the same picture stretched over each eye lands
+    // in two different places and is seen double. A flat colour has no such
+    // problem.
+    const bool stereo = StereoDrawing();
+    const bool stereoFull =
+        stereo && mStereoFillRect && ulxf <= -0.8f && lrxf >= 0.8f && ulyf >= 0.8f && lryf <= -0.8f;
+    if (stereoFull) {
+        ulxf = -1.0f;
+        lrxf = 1.0f;
+        ulyf = 1.0f;
+        lryf = -1.0f;
+    } else if (!stereo) {
+        ulxf = AdjXForAspectRatio(ulxf);
+        lrxf = AdjXForAspectRatio(lrxf);
+    }
 
     struct LoadedVertex* ul = &mRsp->loaded_vertices[MAX_VERTICES + 0];
     struct LoadedVertex* ll = &mRsp->loaded_vertices[MAX_VERTICES + 1];
@@ -4949,7 +5236,7 @@ void Interpreter::GfxDrawRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_
     struct LoadedVertex* ur = &mRsp->loaded_vertices[MAX_VERTICES + 3];
 
     // Final clip coordinates pass through the identity palette entry
-    const uint8_t identity_slot = GetIdentityMtxSlot();
+    const uint8_t identity_slot = (stereo && !stereoFull) ? StereoRectSlot() : GetIdentityMtxSlot();
 
     ul->x = ulxf;
     ul->y = ulyf;
@@ -5132,6 +5419,14 @@ void Interpreter::GfxDpFillRectangle(int32_t ulx, int32_t uly, int32_t lrx, int3
         // via a scissored depth clear instead of drawing a colored rect to the color buffer.
         Flush();
 
+        if (StereoDrawing()) {
+            // The region is in flat-screen pixels, which mean nothing in an eye
+            // pass; whatever follows is drawn over the scene either way.
+            const XYWidthHeight full = StereoFullArea();
+            mRapi->ClearDepthRegion(full.x, full.y, full.width, full.height);
+            return;
+        }
+
         // Convert U10.2 coords to pixel coords and add +1 pixel for fill mode
         int32_t expanded_lrx = lrx + (1 << 2);
         int32_t expanded_lry = lry + (1 << 2);
@@ -5185,7 +5480,9 @@ void Interpreter::GfxDpFillRectangle(int32_t ulx, int32_t uly, int32_t lrx, int3
         GfxDpSetCombineMode(color_comb(0, 0, 0, G_CCMUX_SHADE), alpha_comb(0, 0, 0, G_ACMUX_SHADE), 0, 0);
     }
 
+    mStereoFillRect = true;
     GfxDrawRectangle(ulx, uly, lrx, lry);
+    mStereoFillRect = false;
     mRdp->combine_mode = saved_combine_mode;
 }
 
@@ -7960,13 +8257,31 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     // Previous frame's GPU work is submitted; ids freed by mid-frame invalidation
     // last frame are now safe to reuse.
     TextureCacheReleaseDeferred();
+    // A headset asks for one pass over the display list per eye; the last
+    // pass's image then carries on down the usual path to the window.
+    const int stereoEyes = gStereoHooks.beginFrame != nullptr ? gStereoHooks.beginFrame(&mStereoParams) : 0;
+    const int passes = stereoEyes > 0 ? stereoEyes : 1;
+    auto dbg = mGfxDebugger;
+    for (int pass = 0; pass < passes; pass++) {
+    if (stereoEyes > 0) {
+        if (pass > 0) {
+            SpReset();
+        }
+        gStereoHooks.getEye(pass, &mStereoEye);
+        mStereoActive = true;
+        mStereoSeenWorld = false;
+        mStereoRectSlotValid[0] = mStereoRectSlotValid[1] = false;
+        mStereoScissor[0] = mStereoScissor[1] = 0.0f;
+        mStereoScissor[2] = mNativeDimensions.width;
+        mStereoScissor[3] = mNativeDimensions.height;
+    }
     mRapi->StartDrawToFramebuffer(mRendersToFb ? mGameFb : 0, (float)mCurDimensions.height / mNativeDimensions.height);
-    mRapi->ClearFramebuffer(false, true);
+    // The game's own clears only cover its flat-screen window.
+    mRapi->ClearFramebuffer(stereoEyes > 0, true);
     mRdp->viewport_or_scissor_changed = true;
     mRenderingState.viewport = {};
     mRenderingState.scissor = {};
 
-    auto dbg = mGfxDebugger;
     g_exec_stack.start((F3DGfx*)commands);
     while (!g_exec_stack.cmd_stack.empty()) {
         auto cmd = g_exec_stack.cmd_stack.top();
@@ -7989,6 +8304,27 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     }
 
     Flush();
+    if (stereoEyes > 0) {
+        if (!mStereoSeenWorld) {
+            // A purely 2D screen has no camera to tilt with.
+            static const float identity[4][4] = { { 1, 0, 0, 0 }, { 0, 1, 0, 0 }, { 0, 0, 1, 0 }, { 0, 0, 0, 1 } };
+            memcpy(mStereoLevel, identity, sizeof(identity));
+        }
+        mStereoActive = false;
+        mMtxCurrentValid = false;
+        mMtxIdentityValid = false;
+        if (mFbActive) {
+            mFbActive = 0;
+        }
+        mRapi->StartDrawToFramebuffer(mRendersToFb ? mGameFb : 0,
+                                      (float)mCurDimensions.height / mNativeDimensions.height);
+        gStereoHooks.endEye(pass, mRendersToFb ? mCurDimensions.width : mGfxCurrentWindowDimensions.width,
+                            mRendersToFb ? mCurDimensions.height : mGfxCurrentWindowDimensions.height);
+        mRdp->viewport_or_scissor_changed = true;
+        mRenderingState.viewport = {};
+        mRenderingState.scissor = {};
+    }
+    } // eye passes
     mGfxFrameBuffer = 0;
     currentDir = std::stack<std::string>();
 

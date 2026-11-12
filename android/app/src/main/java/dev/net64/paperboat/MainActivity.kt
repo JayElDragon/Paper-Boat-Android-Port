@@ -59,6 +59,17 @@ class MainActivity : SDLActivity() {
     private external fun togglePortMenu()
     private external fun consumeMenuSoundEvents(): Int
 
+    /**
+     * Called by the engine from the render thread (src/port/android/OpenXR.cpp)
+     * when the headset's launcher button is clicked. Unlike the Main Menu
+     * button this does not finish(): the game stays alive, paused behind the
+     * launcher, and Play there brings this same activity back to the front.
+     */
+    @Suppress("unused")
+    fun openLauncherFromEngine() {
+        runOnUiThread { startActivity(Intent(this, LauncherActivity::class.java)) }
+    }
+
     private fun openPaperOptions() {
         startActivityForResult(Intent(this, PauseMenuActivity::class.java), OPTIONS_REQUEST)
     }
@@ -225,10 +236,12 @@ class MainActivity : SDLActivity() {
             isSoundEffectsEnabled = false
             setOnClickListener { sounds.select(); openPaperOptions() }
         }
+        // Top-right corner, small: centred it covered dialogue boxes.
+        val density = resources.displayMetrics.density
         val menuLayout = FrameLayout.LayoutParams(
-            (110*resources.displayMetrics.density).toInt(), (48*resources.displayMetrics.density).toInt(),
-            Gravity.TOP or Gravity.CENTER_HORIZONTAL
-        ).apply { setMargins(margin, margin, margin, margin) }
+            (84*density).toInt(), (36*density).toInt(),
+            Gravity.TOP or Gravity.END
+        ).apply { setMargins(0, (4*density).toInt(), (6*density).toInt(), 0) }
         findViewById<ViewGroup>(android.R.id.content).addView(portMenuButton, menuLayout)
     }
 

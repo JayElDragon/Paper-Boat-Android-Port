@@ -869,6 +869,14 @@ void GfxWindowBackendSDL2::SyncFramerateWithTime() const {
     previous_time = t;
 }
 
+} // namespace Fast
+
+// Lets the application present the finished frame somewhere other than the
+// window (an OpenXR compositor, for one). Called with the GL context current;
+// returning true means the frame was taken and the window is not swapped.
+namespace Fast {
+bool (*gPresentHook)(SDL_Window* window) = nullptr;
+
 void GfxWindowBackendSDL2::SwapBuffersBegin() {
     bool nextVsyncEnabled = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(CVAR_VSYNC_ENABLED, 1);
 
@@ -879,6 +887,9 @@ void GfxWindowBackendSDL2::SwapBuffersBegin() {
     }
 
     SyncFramerateWithTime();
+    if (gPresentHook != nullptr && gPresentHook(mWnd)) {
+        return;
+    }
     SDL_GL_SwapWindow(mWnd);
 }
 

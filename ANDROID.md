@@ -51,6 +51,8 @@ single-pass shader inspired by the "Paper Mario - Story Book" GShade preset.
 
 ## OpenXR (VR headsets)
 
+VR support was created and contributed by **u/Sea_Attention8964** (Reddit).
+
 On a headset with an OpenXR runtime (Quest, Pico, ...) the game is drawn in
 stereo with 6DoF head tracking, and the motion controllers act as a gamepad.
 Phones and handhelds have no runtime, so they present to the screen exactly as
